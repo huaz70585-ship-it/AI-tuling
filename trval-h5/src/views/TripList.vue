@@ -81,12 +81,17 @@ import {
   travelerCount,
   deriveTripState,
   type TripListItem,
+  type DerivedTripState,
   type DerivedTripStateInfo,
 } from '../api/travel'
 
 const router = useRouter()
 
-type CatKey = 'all' | 'upcoming' | 'generating' | 'done'
+/**
+ * 可筛选的档位。
+ * 刻意不含 'generating'（规划中）—— 见下面 cats 的说明，那个状态真实流程产生不了。
+ */
+type CatKey = 'all' | 'ongoing' | 'upcoming' | 'done'
 
 interface TripCard extends DerivedTripStateInfo {
   id: string
@@ -99,10 +104,23 @@ interface TripCard extends DerivedTripStateInfo {
   day: string
 }
 
+/**
+ * 筛选标签。
+ *
+ * 「进行中」必须有自己的一格：原来「待出行」把 ongoing 一起吞了
+ * （`t.state === 'upcoming' || t.state === 'ongoing'`），于是正在旅行中的
+ * 行程挂在「待出行」下面 —— 语义是反的，也和详情页把「行中」当独立状态
+ * （独立「今天」视图 + 打卡）对不上。
+ *
+ * 不给「规划中」单独的标签：那个状态由 trips.status 驱动，而 status 全项目
+ * 只在创建时写过一次 'ready'（trip.js 的 INSERT），之后没有任何 UPDATE。
+ * 也就是说 generating / draft 只有 seed 数据里手写过、真实流程永远产生不了，
+ * 给它一个筛选标签永远是空的。列表里这类行程仍会带「AI 规划中」徽标兜底。
+ */
 const cats: { key: CatKey; label: string }[] = [
   { key: 'all', label: '全部' },
+  { key: 'ongoing', label: '进行中' },
   { key: 'upcoming', label: '待出行' },
-  { key: 'generating', label: '规划中' },
   { key: 'done', label: '已完成' },
 ]
 const activeCat = ref<CatKey>('all')
@@ -135,21 +153,23 @@ const cards = computed<TripCard[]>(() =>
 /* 排序按行动优先级：进行中 > 待出行 > 规划中 > 已完成 */
 const STYLE_ORDER: Record<TripCard['style'], number> = { live: 0, soon: 1, ai: 2, done: 3 }
 const visibleTrips = computed(() => {
+  // activeCat 除了 'all' 就是某个状态值，所以这里不需要再拼条件
   const filtered =
     activeCat.value === 'all'
       ? cards.value
-      : activeCat.value === 'upcoming'
-        ? cards.value.filter((t) => t.state === 'upcoming' || t.state === 'ongoing')
-        : cards.value.filter((t) => t.state === activeCat.value)
+      : cards.value.filter((t) => t.state === activeCat.value)
   return [...filtered].sort((a, b) => STYLE_ORDER[a.style] - STYLE_ORDER[b.style])
 })
 
-const counts = computed<Record<CatKey, number>>(() => ({
-  all: cards.value.length,
-  upcoming: cards.value.filter((t) => t.state === 'upcoming' || t.state === 'ongoing').length,
-  generating: cards.value.filter((t) => t.state === 'generating').length,
-  done: cards.value.filter((t) => t.state === 'done').length,
-}))
+const counts = computed<Record<CatKey, number>>(() => {
+  const byState = (s: DerivedTripState) => cards.value.filter((t) => t.state === s).length
+  return {
+    all: cards.value.length,
+    ongoing: byState('ongoing'),
+    upcoming: byState('upcoming'),
+    done: byState('done'),
+  }
+})
 
 function goDetail(t: TripCard) {
   router.push(`/trip/${t.id}`)

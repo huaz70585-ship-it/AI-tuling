@@ -32,7 +32,10 @@ export async function streamSse(options: SseOptions): Promise<void> {
       signal,
     })
     if (!response.ok || !response.body) {
-      throw new Error(`SSE 请求失败：HTTP ${response.status}`)
+      // 错误对象带上 HTTP 状态码，让上层能按 4xx/5xx/429 分类成友好文案
+      const err = new Error(`SSE 请求失败：HTTP ${response.status}`) as Error & { status?: number }
+      err.status = response.status
+      throw err
     }
 
     const reader = response.body.getReader()

@@ -24,6 +24,22 @@ const router = createRouter({
     { path: '/profile', name: 'profile', component: Profile },
     { path: '/login', name: 'login', component: Login },
   ],
+
+  /**
+   * 每次进入页面都回到顶部。
+   *
+   * 不配这个的话，窗口的滚动位置会一直留着：从对话页返回首页时，首页会停在
+   * 上次滚到的地方（点底栏「首页」也一样，因为没人重置过窗口滚动）。
+   *
+   * 刻意【不做】savedPosition 恢复 —— Vue Router 文档里常见的写法是
+   * `savedPosition || { top: 0 }`，那会让「按浏览器返回键时恢复原位置」生效。
+   * 本产品是标签页式结构（底栏切来切去、详情页返回列表），每次进来从头看更
+   * 符合预期，所以这里无条件回顶部。
+   *
+   * 注意：只对「窗口自身滚动」的页面有意义。对话页是内部容器滚动
+   * （.chat 固定 100vh + 消息区自己 overflow-y），它自己管滚动，不受这里影响。
+   */
+  scrollBehavior: () => ({ top: 0 }),
 })
 
 // 全局前置守卫

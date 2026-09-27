@@ -29,18 +29,25 @@
     </div>
 
     <template v-else>
-      <!-- Tab 切换：行程 / 地图 -->
+      <!-- Tab：行程。行中时多一个「今天」并默认落在它上面
+           （不是在行中就不显示 —— 未来的行程谈不上「今天」） -->
       <div class="seg">
-        <button class="seg__btn" :class="{ 'is-active': view === 'plan' }" @click="view = 'plan'">
-          行程
+        <button
+          v-if="isTraveling"
+          class="seg__btn"
+          :class="{ 'is-active': view === 'today' }"
+          @click="switchView('today')"
+        >
+          今天
         </button>
-        <button class="seg__btn" :class="{ 'is-active': view === 'map' }" @click="view = 'map'">
-          <van-icon name="location-o" /> 地图
+        <button class="seg__btn" :class="{ 'is-active': view === 'plan' }" @click="switchView('plan')">
+          行程
         </button>
       </div>
 
-    <!-- 日期芯片（由 trip.days 驱动，不再写死 4 天） -->
-    <div class="days">
+    <!-- 日期芯片（由 trip.days 驱动，不再写死 4 天）。
+         「今天」视图不需要它 —— 那里只有今天，没有可切的天 -->
+    <div v-if="view !== 'today'" class="days">
       <button
         v-for="d in trip?.days ?? []"
         :key="d.id"
@@ -50,8 +57,8 @@
       >D{{ d.day_index }}</button>
     </div>
 
-    <!-- 当日头部：日期 / 天气 / 预算 -->
-    <div class="dayhead">
+    <!-- 当日头部：日期 / 天气 / 预算（「今天」视图自带头部，见下方 .today__head） -->
+    <div v-if="view !== 'today'" class="dayhead">
       <span class="dayhead__d">D{{ activeDayIndex }}</span>
       <span class="dayhead__date">{{ activeDayDate }}</span>
       <!-- 天气：Open-Meteo 每日预报（超出预报范围 / 定位失败时不显示） -->
@@ -62,9 +69,83 @@
       <span class="dayhead__budget">当日 <em>¥{{ activeDayBudget }}</em></span>
     </div>
 
-    <!-- 地图视图：坐标是后端回填的（GCJ-02），前端只画不算 -->
-    <template v-if="view === 'map'">
-      <TripMap :items="dayItems" />
+    <!-- 行中视图：今天该干嘛。和「行程」的差别是排序与预算口径 ——
+         未完成在前（已完成折叠）、预算只看「还要花多少」，
+         因为出门后关心的是「接下来」，不是「我计划过什么」 -->
+    <template v-if="view === 'today'">
+      <div class="today">
+        <div class="today__head">
+          <span class="today__d">D{{ todayDayIndex }}</span>
+          <span class="today__date">{{ todayDateText }}</span>
+          <span v-if="todayWeather" class="today__weather">
+            <span class="today__wicon" v-html="weatherIcon(todayWeather.icon)"></span>
+            {{ todayWeather.text }} {{ todayWeather.tmax }}°
+          </span>
+        </div>
+
+        <!-- 当天天气提醒（与「行程」视图同一份规则） -->
+        <div v-if="todayWeatherAlert" class="walert">
+          <span class="walert__ic" v-html="weatherIcon(todayWeather?.icon)"></span>
+          <p>{{ todayWeatherAlert }}</p>
+        </div>
+
+        <!-- 进度 -->
+        <div v-if="todayItems.length" class="prog">
+          <span class="prog__track"><span class="prog__fill" :style="{ width: todayProgress + '%' }"></span></span>
+          <span class="prog__text">{{ todayDone.length }}/{{ todayItems.length }}</span>
+        </div>
+
+        <!-- 下一站：单独拎出来，别被后面的项淹掉 -->
+        <div v-if="nextItem" class="next">
+          <p class="next__label">下一站</p>
+          <p class="next__title">{{ nextItem.title }}</p>
+          <p class="next__meta">
+            {{ nextItem.start_time }}
+            <template v-if="nextItem.price_ref"> · 人均 ¥{{ nextItem.price_ref }}</template>
+            <span v-if="isOverdue(nextItem)" class="late">已过时</span>
+          </p>
+          <button class="next__btn" @click="onCheckItem(nextItem)">我已去过</button>
+        </div>
+
+        <!-- 后续待办 -->
+        <div v-if="todayRest.length" class="tlist">
+          <div v-for="i in todayRest" :key="i.id" class="titem">
+            <div class="titem__body">
+              <p class="titem__title">{{ i.title }}</p>
+              <p class="titem__meta">
+                {{ i.start_time }}
+                <template v-if="i.price_ref"> · 人均 ¥{{ i.price_ref }}</template>
+                <span v-if="isOverdue(i)" class="late">已过时</span>
+              </p>
+            </div>
+            <button class="titem__check" @click="onCheckItem(i)">打卡</button>
+          </div>
+        </div>
+
+        <!-- 已完成：默认折叠，走一天后它会淹掉「下一站」 -->
+        <div v-if="todayDone.length" class="done">
+          <button class="done__head" @click="doneExpanded = !doneExpanded">
+            已完成 {{ todayDone.length }} 项
+            <van-icon :name="doneExpanded ? 'arrow-up' : 'arrow-down'" />
+          </button>
+          <div v-if="doneExpanded" class="tlist">
+            <div v-for="i in todayDone" :key="i.id" class="titem titem--done">
+              <div class="titem__body">
+                <p class="titem__title">{{ i.title }}</p>
+                <p class="titem__meta">{{ checkTimeText(i) }} 已打卡</p>
+              </div>
+              <button class="titem__check titem__check--undo" @click="onCheckItem(i)">撤销</button>
+            </div>
+          </div>
+        </div>
+
+        <p v-if="!todayItems.length" class="today__empty">今天没有安排</p>
+
+        <p v-if="todayItems.length" class="today__foot">
+          <template v-if="todayPending.length">今天还要花 <em>¥{{ todayLeftBudget }}</em></template>
+          <template v-else>今天的安排全部走完啦</template>
+        </p>
+      </div>
     </template>
 
     <template v-else>
@@ -95,9 +176,11 @@
               <p class="tl__title">{{ row.item.title }}</p>
               <p class="tl__meta">{{ tagList(row.item).join(' · ') }}</p>
               <!-- 决策卡入口：整卡的 @click 已经被「选中/操作」占用，所以这里必须 @click.stop。
-                   匹配不到城市景点库的项（如"午餐"）会被永久隐藏本按钮（noSpot），不留死入口 -->
+                   抵达/返程是行程边界动作、不是景点，按语义直接不给入口（boundary 由后端判定）；
+                   其余匹配不到城市景点库的项（如"午餐"）仍会在查一次失败后永久隐藏（noSpot），不留死入口。
+                   不靠 noSpot 挡边界项的原因：那样得先让用户点一次、等一次请求、失败后才消失。 -->
               <button
-                v-if="!noSpot.includes(row.item.title)"
+                v-if="!row.item.boundary && !noSpot.includes(row.item.title)"
                 class="tl__why"
                 @click.stop="openSpot(row.item)"
               >
@@ -112,12 +195,17 @@
         </div>
 
         <!-- 到下一站的交通衔接（AI 生成；未生成成功时不渲染，不占位）。
-             视觉是卡片之间的一段虚线「路」，信息行内化，不再占色块 -->
+             视觉是卡片之间的一段虚线「路」，信息行内化，不再占色块。
+             点击「方式」可切换（主推 + AI 备选，本地零延迟） -->
         <div v-if="row.hop" class="hop">
           <div class="hop__rail"><span class="hop__dash"></span></div>
           <div class="hop__main">
             <div class="hop__row">
-              <span class="hop__mode">{{ row.hop.label }}</span>
+              <button class="hop__mode" @click.stop="openHopPicker(row.hop.from_item_id)">
+                <span class="hop__ic" v-html="HOP_ICONS[row.hop.mode] ?? HOP_ICONS.unknown"></span>
+                {{ row.hop.label }}
+                <van-icon name="arrow-down" />
+              </button>
               <!-- 收尾段的目标不是景点，是当地的火车站/机场，单独标出来 -->
               <span v-if="row.hop.dest" class="hop__dest">→ {{ row.hop.dest }}</span>
               <span class="hop__meta">
@@ -125,7 +213,14 @@
               </span>
               <span v-if="row.hop.tight" class="hop__warn">衔接偏紧</span>
             </div>
-            <p v-if="row.hop.tip" class="hop__tip">{{ row.hop.tip }}</p>
+            <!-- 分步走法：坐几号线/换乘/哪站下/哪个口，每步一个动作图标串成动线 -->
+            <ol v-if="row.hop.steps.length" class="hop__steps">
+              <li v-for="(s, i) in row.hop.steps" :key="i" class="hop__step">
+                <span class="hop__step-ic" v-html="STEP_ICONS[s.icon] ?? STEP_ICONS.walk"></span>
+                <span class="hop__step-text">{{ s.text }}</span>
+              </li>
+            </ol>
+            <p v-else-if="row.hop.tip" class="hop__tip">{{ row.hop.tip }}</p>
           </div>
         </div>
       </template>
@@ -147,18 +242,6 @@
       </div>
     </div>
 
-    <!-- 当日交通汇总（由真实 hop 数据合成；原来这里是写死的假文案） -->
-    <div class="ai-sum">
-      <span class="ai-sum__ic">
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3Z" fill="currentColor"/>
-        </svg>
-      </span>
-      <p>
-        {{ hopSummary.head }}<template v-if="hopSummary.cost !== null"> · <em class="ai-sum__cost">人均约 ¥{{ hopSummary.cost }}</em></template>{{ hopSummary.tail }}
-      </p>
-    </div>
-
     <!-- AI 免责提示：纯文字居中，不占卡片
          （原「N 项安排待你确认」+「去确认」按钮 + 黄色卡已全部下线：
            ai_confidence 一直是 null，永远显示 0 项，按钮点进去只是占位 toast） -->
@@ -170,12 +253,25 @@
 
     <!-- 选中项操作栏（选中某 item 时替换底部操作栏） -->
     <footer v-if="selectedItemId" class="item-actionbar">
-      <button class="item-actionbar__btn" @click="onMoveItem('up')">
-        <van-icon name="arrow-up" /> 上移
-      </button>
-      <button class="item-actionbar__btn" @click="onMoveItem('down')">
-        <van-icon name="arrow-down" /> 下移
-      </button>
+      <!-- 边界项（抵达/返程）位置固定，把两个移动按钮换成一句说明；
+           普通项则按方向禁用（把第二项上移会顶走「抵达」，那个方向同样关掉） -->
+      <span v-if="selectedBoundaryHint" class="item-actionbar__hint">{{ selectedBoundaryHint }}</span>
+      <template v-else>
+        <button
+          class="item-actionbar__btn"
+          :disabled="!canMoveSelectedUp"
+          @click="onMoveItem('up')"
+        >
+          <van-icon name="arrow-up" /> 上移
+        </button>
+        <button
+          class="item-actionbar__btn"
+          :disabled="!canMoveSelectedDown"
+          @click="onMoveItem('down')"
+        >
+          <van-icon name="arrow-down" /> 下移
+        </button>
+      </template>
       <button class="item-actionbar__btn item-actionbar__btn--del" @click="onDeleteItem">
         <van-icon name="delete-o" /> 删除
       </button>
@@ -236,23 +332,73 @@
       </div>
     </van-popup>
 
-    <!-- AI 调整整条行程：一句话说出你想怎么改，AI 重排后逐天落库。
-         改完主动刷新行程，底部预算会跟着新的行程项重算 -->
-    <van-popup v-model:show="optOpen" position="bottom" round>
+    <!-- 交通方式切换：点击衔接条弹出，主推 + AI 备选，选中即本地生效（零延迟） -->
+    <van-popup v-model:show="hopPickerOpen" position="bottom" round :style="{ maxHeight: '60%' }">
+      <div class="hop-picker">
+        <p class="hop-picker__title">{{ hopPickerTitle }} · 怎么去</p>
+        <ul class="hop-picker__list">
+          <li
+            v-for="opt in hopPickerList"
+            :key="opt.mode"
+            class="hop-picker__item"
+            :class="{ 'is-active': opt.active }"
+            @click="onPickHop(opt)"
+          >
+            <span class="hop-picker__ic" v-html="HOP_ICONS[opt.mode] ?? HOP_ICONS.unknown"></span>
+            <div class="hop-picker__body">
+              <p class="hop-picker__name">
+                {{ opt.label }}
+                <span class="hop-picker__meta">
+                  {{ opt.meta }}<template v-if="opt.cost !== null"> · 约 ¥{{ opt.cost }}</template>
+                </span>
+              </p>
+              <!-- 一句摘要（第一步走法）；选中后衔接条展开完整步骤 -->
+              <p v-if="opt.summary" class="hop-picker__tip">{{ opt.summary }}</p>
+            </div>
+            <van-icon v-if="opt.active" name="success" class="hop-picker__check" />
+          </li>
+        </ul>
+      </div>
+    </van-popup>
+
+    <!-- AI 对话（agent 会话）：一句话说出你想怎么改，AI 自己决定是查天气还是重排行程，
+         并把「调用了什么工具」实时显示出来 —— 过程外化，用户看得见 AI 在做什么。
+         写操作落库后主动重取详情，底部预算跟着新的行程项重算 -->
+    <van-popup v-model:show="optOpen" position="bottom" round :style="{ maxHeight: '78vh' }">
       <div class="opt">
         <p class="opt__title">AI 调整行程</p>
         <p class="opt__hint">用一句话说说你想怎么改 · 如「购物太多，换成亲子项目」</p>
+
+        <!-- 工具调用进度 -->
+        <div v-if="agentSteps.length" class="opt__steps">
+          <div
+            v-for="(s, i) in agentSteps"
+            :key="i"
+            class="opt__step"
+            :class="{ 'is-fail': !s.ok }"
+          >
+            <van-icon :name="s.ok ? 'passed' : 'warning-o'" />
+            <span class="opt__step-name">{{ AGENT_TOOL_LABEL[s.tool] || s.tool }}</span>
+            <span class="opt__step-state">{{ s.ok ? '完成' : '失败' }}</span>
+          </div>
+        </div>
+
+        <!-- 最终答复（流式累积） -->
+        <p v-if="agentReply" class="opt__reply">{{ agentReply }}</p>
+
         <textarea
           v-model="optText"
           class="opt__input"
           rows="3"
           maxlength="120"
-          placeholder="例如：加一天当地美食 / 把D2换成亲子乐园 / 节奏放慢点，别太赶"
+          placeholder="例如：加一天当地美食 / 把D2换成亲子乐园 / 这几天会下雨吗"
         ></textarea>
         <div class="opt__row">
-          <button class="opt__cancel" :disabled="optimizing" @click="optOpen = false">取消</button>
+          <button class="opt__cancel" :disabled="optimizing" @click="onOptCancel">
+            {{ optimizing ? '停止' : (agentReply ? '关闭' : '取消') }}
+          </button>
           <button class="opt__go" :disabled="optimizing || !optText.trim()" @click="onOptimize">
-            {{ optimizing ? 'AI 调整中…' : '开始调整' }}
+            {{ optimizing ? 'AI 处理中…' : '开始调整' }}
           </button>
         </div>
       </div>
@@ -351,7 +497,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showToast, showConfirmDialog, showLoadingToast } from 'vant'
 import {
@@ -360,15 +506,17 @@ import {
   moveTripItem,
   updateTrip,
   generateTripDay,
-  optimizeTrip,
+  checkTripItem,
   formatDateRange,
   formatDateCn,
   formatMoney,
   type TripDetail,
   type TripItem,
 } from '../api/travel'
+import { streamTripAgent, AGENT_TOOL_LABEL, type AgentStep, type AgentTurn } from '../api/agent'
 import { getTripWeather, type DayWeather } from '../api/weather'
-import { getTripHops, type TripHop, type HopMode } from '../api/hop'
+import { getTripHops, type TripHop, type HopMode, type HopStep } from '../api/hop'
+import { HOP_ICONS, STEP_ICONS } from '../utils/hopIcons'
 import { weatherAlertText } from '../utils/weatherAlert'
 import {
   getCitySpots,
@@ -377,7 +525,6 @@ import {
   type CitySpot,
   type SpotDetail,
 } from '../api/city'
-import TripMap from '../components/TripMap.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -388,8 +535,18 @@ const activeDayIndex = ref(1)
 const loadError = ref(false)
 /** 当前选中的行程项 ID（用于删除/上移/下移操作） */
 const selectedItemId = ref<string | null>(null)
-/** 顶部 Tab：行程 / 地图（原「地图」按钮是死的，只有样式没有 @click） */
-const view = ref<'plan' | 'map'>('plan')
+/** 顶部 Tab：今天 / 行程（「今天」只在行中时出现，详见 isTraveling） */
+const view = ref<'today' | 'plan'>('plan')
+
+/**
+ * 切视图时顺手清掉选中项。
+ * 否则在「行程」里选中一项后切到「今天」，底部还挂着上移/删除，
+ * 操作的是屏幕上根本看不见的那一项。
+ */
+function switchView(v: 'today' | 'plan') {
+  view.value = v
+  if (v !== 'plan') selectedItemId.value = null
+}
 
 const tripId = computed(() => String(route.params.id ?? '1001'))
 
@@ -495,10 +652,15 @@ const billableWeight = computed(() => {
   return t ? t.adults + (t.children?.length ?? 0) * 0.5 : 1
 })
 
-/** 当日金额 = 当天各项目人均价之和 × 计费人数 */
+/**
+ * 当日金额 = 当天门票人均价之和 × 计费人数 + 当天交通衔接费。
+ * 口径与后端 computeBudget 一致：门票按人头乘权重；hop 是整车/整程的钱（打车/公交），
+ * 不随人数翻倍，直接加。原来只算门票，导致当日价格漏掉每段交通费。
+ */
 const activeDayBudget = computed(() =>
   formatMoney(
-    (activeDay.value?.items ?? []).reduce((s, it) => s + (it.price_ref ?? 0), 0) * billableWeight.value,
+    (activeDay.value?.items ?? []).reduce((s, it) => s + (it.price_ref ?? 0), 0) * billableWeight.value
+      + hops.value.reduce((s, h) => s + (h.cost_ref ?? 0), 0),
   ),
 )
 
@@ -548,6 +710,174 @@ const dayItems = computed<TripItem[]>(() =>
   [...(activeDay.value?.items ?? [])].sort((a, b) => a.sort_order - b.sort_order),
 )
 
+/* ── 边界项（抵达/返程）：位置固定在当天首/末，不给移动入口 ────────── */
+
+/**
+ * 交换 idx 与 swapIdx 之后，抵达是否仍在首位、返程是否仍在末位。
+ *
+ * 判的是【交换后的整个顺序】，不是「被拖的是不是边界项」——
+ * 把第二项往上拖同样会把「抵达」顶到中间，只判被拖项会漏掉这种情况。
+ * 与后端 routes/trip.js 的拦截同一条规则（那边是兜底，这边是提前关入口）。
+ */
+function breaksBoundary(list: TripItem[], idx: number, swapIdx: number): boolean {
+  const next = [...list]
+  const tmp = next[idx]
+  next[idx] = next[swapIdx]
+  next[swapIdx] = tmp
+  const last = next.length - 1
+  if (next.some((it, i) => i !== 0 && it.boundary === 'arrival')) return true
+  if (next.some((it, i) => i !== last && it.boundary === 'closing')) return true
+  return false
+}
+
+const selectedIndex = computed(() => dayItems.value.findIndex((i) => i.id === selectedItemId.value))
+
+const canMoveSelectedUp = computed(
+  () => selectedIndex.value > 0 && !breaksBoundary(dayItems.value, selectedIndex.value, selectedIndex.value - 1),
+)
+const canMoveSelectedDown = computed(
+  () =>
+    selectedIndex.value >= 0 &&
+    selectedIndex.value < dayItems.value.length - 1 &&
+    !breaksBoundary(dayItems.value, selectedIndex.value, selectedIndex.value + 1),
+)
+
+/**
+ * 选中边界项时的说明文案，用它替换两个移动按钮。
+ * 光把按钮灰掉不给原因，用户会以为功能坏了。
+ */
+const selectedBoundaryHint = computed(() => {
+  const b = dayItems.value.find((i) => i.id === selectedItemId.value)?.boundary
+  if (b === 'arrival') return '抵达固定在第一天'
+  if (b === 'closing') return '返程固定在最后一天'
+  return ''
+})
+
+/* ══════════════════════════════════════════════════════════
+   行中模式：今天该干嘛 + 打卡
+   心态和「行程」不同 —— 不是「我的计划长什么样」，
+   而是「我接下来干嘛」。所以未完成的在前、已完成折叠，预算只看「还要花多少」。
+   ══════════════════════════════════════════════════════════ */
+
+/** 时间心跳：每 60s 走一格，保证「已过时」提示准确、跨零点能自己翻篇 */
+const nowTick = ref(Date.now())
+let tickTimer: number | undefined
+onMounted(() => {
+  tickTimer = window.setInterval(() => { nowTick.value = Date.now() }, 60_000)
+})
+onUnmounted(() => {
+  if (tickTimer !== undefined) window.clearInterval(tickTimer)
+})
+
+/** 本地日期 YYYY-MM-DD。不能用 toISOString —— 那是 UTC，东八区下午 4 点后日期会偏一天 */
+function localDate(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+const todayStr = computed(() => localDate(new Date(nowTick.value)))
+
+/**
+ * 是否处于「行中」。纯靠日期推导，不写库、不用用户点「开始旅行」：
+ *   today < start_date            → 行前
+ *   start_date ≤ today ≤ end_date → 行中
+ *   today > end_date              → 已结束
+ * 好处是改期后自动跟着变，也不会出现「状态说在旅行、日期却是下周」的脏数据。
+ */
+const isTraveling = computed(() => {
+  const t = trip.value
+  if (!t) return false
+  return todayStr.value >= t.start_date && todayStr.value <= t.end_date
+})
+
+// 进入行中默认落在「今天」；行程被改到未来时把残留的「今天」Tab 收回去。
+// 只在 isTraveling 真正翻转时触发，所以用户手动切到地图/行程不会被覆盖。
+watch(
+  isTraveling,
+  (traveling) => {
+    if (traveling) view.value = 'today'
+    else if (view.value === 'today') view.value = 'plan'
+  },
+  { immediate: true },
+)
+
+/** 「今天」是行程里的第几天；取不到时退回当前选中的那天 */
+const todayDayIndex = computed(() => {
+  const t = trip.value
+  if (!t) return activeDayIndex.value
+  return t.days.find((d) => d.date === todayStr.value)?.day_index ?? activeDayIndex.value
+})
+
+const todayDay = computed(
+  () => trip.value?.days.find((d) => d.day_index === todayDayIndex.value) ?? null,
+)
+const todayDateText = computed(() => (todayDay.value ? formatDateCn(todayDay.value.date) : ''))
+const todayWeather = computed(() => (todayDay.value ? weather.value[todayDay.value.date] : undefined))
+/** 当天天气提醒（与「行程」视图同一份规则：只有雨雪雾/极端温度才出现） */
+const todayWeatherAlert = computed(() => weatherAlertText(todayWeather.value))
+
+const todayItems = computed<TripItem[]>(() =>
+  [...(todayDay.value?.items ?? [])].sort((a, b) => a.sort_order - b.sort_order),
+)
+const todayPending = computed(() => todayItems.value.filter((i) => !i.done_at))
+const todayDone = computed(() => todayItems.value.filter((i) => i.done_at))
+/** 下一站 = 第一个还没打卡的项 */
+const nextItem = computed(() => todayPending.value[0] ?? null)
+/** 下一站之后的待办 */
+const todayRest = computed(() => todayPending.value.slice(1))
+
+const todayProgress = computed(() =>
+  todayItems.value.length ? Math.round((todayDone.value.length / todayItems.value.length) * 100) : 0,
+)
+/** 今天还要花多少 = 未打卡项人均价之和 × 计费人数（行中只关心「还要花多少」，不是总额） */
+const todayLeftBudget = computed(() =>
+  formatMoney(todayPending.value.reduce((s, i) => s + (i.price_ref ?? 0), 0) * billableWeight.value),
+)
+
+/** 整条行程已打卡的项数。AI 重排会物理删掉这些记录，重排前拿它做确认 */
+const checkedCount = computed(() =>
+  (trip.value?.days ?? []).reduce((n, d) => n + d.items.filter((i) => i.done_at).length, 0),
+)
+
+/** 已完成项的展开态。默认折叠：走一天后已完成会淹掉「下一站」 */
+const doneExpanded = ref(false)
+
+/** 该项的出发时间是否已经过了（只对「今天」有意义，提示别赶不上） */
+function isOverdue(item: TripItem): boolean {
+  const day = todayDay.value
+  if (!item.start_time || !day) return false
+  if (day.date !== todayStr.value) return false // 不是今天就不谈过不过时
+  const [h, m] = item.start_time.split(':').map(Number)
+  const at = new Date(nowTick.value)
+  at.setHours(h || 0, m || 0, 0, 0)
+  return at.getTime() < nowTick.value
+}
+
+/** 打卡时间 → HH:mm */
+function checkTimeText(item: TripItem): string {
+  if (!item.done_at) return ''
+  const d = new Date(item.done_at)
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/**
+ * 打卡 / 撤销打卡。
+ * 【乐观更新】：先改本地立刻出效果，请求在后台飞，失败再回滚 ——
+ * 走路时点一下还要等 300ms 网络很难受。后端幂等，重发安全。
+ */
+async function onCheckItem(item: TripItem) {
+  const nextDone = !item.done_at
+  const prev = item.done_at
+  item.done_at = nextDone ? new Date().toISOString() : null
+  try {
+    const res = await checkTripItem(tripId.value, item.id, nextDone)
+    item.done_at = res.done_at // 以后端时间为准
+  } catch {
+    item.done_at = prev // 回滚
+    showToast(nextDone ? '打卡失败，请重试' : '撤销失败，请重试')
+  }
+}
+
 /* ── 相邻项的交通衔接（后端缓存优先，首次由 AI 生成；失败静默不显示） ────── */
 const hops = ref<TripHop[]>([])
 
@@ -570,11 +900,17 @@ function toMinutes(hhmm: string): number {
 
 /** 展示就绪的一段交通 */
 interface HopView {
+  /** 原始方式（找图标用；unknown →「前往」箭头） */
+  mode: HopMode
+  /** 这段衔接的起点行程项 id（打开方式切换面板用） */
+  from_item_id: string
   label: string
   meta: string
   /** 人均交通费估算（元）；null 时不渲染金额段（模板负责把 ¥ 金额染成 --c-money 红） */
   cost: number | null
   tip: string
+  /** 详细分步走法（坐几号线/换乘/哪站下/哪个口）；空则退回单句 tip */
+  steps: HopStep[]
   /** 收尾段（最后一站 → 返程）的目标：不是景点而是当地车站/机场，null 则不渲染 */
   dest: string | null
   /** 上一项占用 + 在途时间 > 两站时间差时为 true（衔接偏紧） */
@@ -600,10 +936,13 @@ const timeline = computed(() =>
       const spare =
         next ? toMinutes(next.start_time) - toMinutes(item.start_time) - (item.duration_min ?? 0) : 0
       hop = {
+        mode: raw.mode,
+        from_item_id: raw.from_item_id,
         label: HOP_LABELS[raw.mode] ?? '前往',
         meta: raw.duration_min ? `${raw.duration_min} 分钟` : '—',
         cost: raw.cost_ref ? raw.cost_ref : null,
         tip: raw.tip,
+        steps: Array.isArray(raw.steps) ? raw.steps : [],
         // 返程项本身没有地名（AI 只知道它是「返程」），后端按「当地车站/机场」估的，
         // 这里把目标显式写出来，否则用户只看到「打车 35 分钟」不知道去哪
         dest: raw.kind === 'return' ? '车站 / 机场' : null,
@@ -614,24 +953,86 @@ const timeline = computed(() =>
   }),
 )
 
-/**
- * 当日交通汇总。拆成三段是因为金额（cost）要单独染红 ——
- * 纯文本拼接没法只给 ¥ 那截上色。
- */
-const hopSummary = computed<{ head: string; cost: number | null; tail: string }>(() => {
-  const valid = hops.value.filter((h) => h.mode)
-  if (!valid.length) return { head: '当天暂无交通衔接建议', cost: null, tail: '' }
-  const totalMin = valid.reduce((s, h) => s + (h.duration_min ?? 0), 0)
-  const totalCost = valid.reduce((s, h) => s + (h.cost_ref ?? 0), 0)
-  const byMode = new Map<string, number>()
-  for (const h of valid) byMode.set(h.mode!, (byMode.get(h.mode!) ?? 0) + 1)
-  const desc = [...byMode].map(([m, n]) => `${HOP_LABELS[m as HopMode] ?? '前往'} ${n} 段`).join(' · ')
-  return {
-    head: `当天交通约 ${totalMin} 分钟`,
-    cost: totalCost > 0 ? totalCost : null,
-    tail: `（${desc}）`,
+/* ── 交通方式切换（点击衔接条弹面板，本地切换零延迟，不发请求） ────────── */
+const hopPickerOpen = ref(false)
+const hopPickerId = ref('')
+const hopPickerTitle = ref('')
+
+interface HopOption {
+  mode: HopMode
+  duration_min: number | null
+  cost_ref: number | null
+  /** 详细分步走法（选中后顶替衔接条的步骤列表） */
+  steps: HopStep[]
+  /** 一句摘要（面板第二行）：取第一步走法，没有则取 tip */
+  summary: string
+  tip: string
+  label: string
+  meta: string
+  cost: number | null
+  active: boolean
+}
+const hopPickerList = ref<HopOption[]>([])
+
+/** 打开方式切换面板：主推 + AI 给的备选，按顺序列出 */
+function openHopPicker(fromItemId: string) {
+  const h = hops.value.find((x) => x.from_item_id === fromItemId)
+  if (!h?.mode) return
+  const options: Array<{ mode: HopMode; duration_min: number | null; cost_ref: number | null; tip?: string; steps?: HopStep[] }> = [
+    { mode: h.mode, duration_min: h.duration_min, cost_ref: h.cost_ref, tip: h.tip, steps: h.steps ?? [] },
+    ...(Array.isArray(h.alts) ? h.alts : []),
+  ]
+  // 同 mode 只留第一项（AI 偶尔把主选重复写进 alts）
+  const seen = new Set<string>()
+  const list: HopOption[] = []
+  for (const o of options) {
+    if (!o?.mode || seen.has(o.mode)) continue
+    seen.add(o.mode)
+    const steps = Array.isArray(o.steps) ? o.steps : []
+    list.push({
+      mode: o.mode,
+      duration_min: o.duration_min,
+      cost_ref: o.cost_ref,
+      steps,
+      summary: steps[0]?.text ?? o.tip ?? '',
+      tip: o.tip ?? '',
+      label: HOP_LABELS[o.mode] ?? '前往',
+      meta: o.duration_min ? `${o.duration_min} 分钟` : '—',
+      cost: o.cost_ref || null,
+      active: o.mode === h.mode,
+    })
   }
-})
+  hopPickerId.value = fromItemId
+  hopPickerTitle.value = `${h.from_title} → ${h.to_title}`
+  hopPickerList.value = list
+  hopPickerOpen.value = true
+}
+
+/** 选中一个方式：本地覆盖该段（原主选降级进备选），零延迟生效 */
+function onPickHop(opt: HopOption) {
+  const h = hops.value.find((x) => x.from_item_id === hopPickerId.value)
+  if (!h) return
+  if (opt.mode !== h.mode) {
+    const prev = {
+      mode: h.mode as HopMode,
+      duration_min: h.duration_min,
+      cost_ref: h.cost_ref,
+      steps: h.steps ?? [],
+    }
+    const alts = (h.alts ?? []).filter((a) => a.mode !== opt.mode)
+    if (prev.mode) alts.unshift(prev)
+    h.mode = opt.mode
+    h.duration_min = opt.duration_min
+    h.cost_ref = opt.cost_ref
+    // 分步走法跟着换：衔接条的步骤列表显示选中方式的「几号线/哪站下/哪个口」
+    h.steps = opt.steps
+    h.tip = opt.tip
+    h.alts = alts
+    // hops 元素是普通对象，直接改字段不触发响应式；浅拷贝数组让 timeline 重算
+    hops.value = [...hops.value]
+  }
+  hopPickerOpen.value = false
+}
 
 /** 时间轴圆点三态：已过时刻 past，第一个未到的 now，其余 next */
 function dotState(i: number): 'past' | 'now' | 'next' {
@@ -740,7 +1141,9 @@ async function onMoveItem(dir: 'up' | 'down') {
     // 顺序变了，相邻配对也变了：强制重拉，旧数据留在屏幕上直到新响应到达（不闪空）
     void loadHops(true)
   } catch {
-    showToast('移动失败')
+    // 不在这里再 toast：request.ts 的响应拦截器已经弹过后端的原始 message
+    // （如「抵达固定在当天第一位，不能移动」）。再补一句「移动失败」会把它盖掉，
+    // 用户只看到笼统的失败原因，不知道到底为什么不能移。
   }
 }
 
@@ -752,35 +1155,120 @@ const saving = ref(false)
 /** 单天补排请求在飞（空天上的按钮态） */
 const dayGenerating = ref(false)
 
-/* ── AI 调整整条行程 ───────────────────────── */
+/* ── AI 调整行程（agent 会话） ─────────────────
+   与旧实现的区别：不再由前端决定「调哪个后端接口」，而是把要求发给 agent，
+   AI 自己决定是查天气还是重排行程（见后端 src/agent/loop.js）。 */
 const optOpen = ref(false)
 const optText = ref('')
 const optimizing = ref(false)
-async function onOptimize() {
+/** 已执行的工具调用，用来把 AI 的「过程」显示给用户 */
+const agentSteps = ref<AgentStep[]>([])
+/** 最终答复，流式累积 */
+const agentReply = ref('')
+/**
+ * 本次会话的轮次（跨轮记忆）。只存纯文本 —— 工具效果已落库、
+ * 行程现状每轮都重新注入 system prompt，不需要回放工具调用。
+ * 有了它，AI 问「要不要帮你把27号调成室内」后，用户回一个「好」才接得住。
+ */
+const agentHistory = ref<AgentTurn[]>([])
+/** 历史只留最近 N 轮，别让上下文无限长（与后端 MAX_TURNS 对齐） */
+const AGENT_HISTORY_LIMIT = 10
+let agentController: AbortController | null = null
+
+function onOptimize() {
   const instruction = optText.value.trim()
-  if (!instruction || !trip.value) return
-  optimizing.value = true
-  const toast = showLoadingToast({ message: 'AI 正在重排行程…', forbidClick: true, duration: 0 })
-  try {
-    const res = await optimizeTrip(tripId.value, instruction)
-    trip.value = res
-    // 重排后当前天可能变了，回到第 1 天并刷新天气
-    activeDayIndex.value = 1
-    void loadWeather(tripId.value)
-    optOpen.value = false
-    optText.value = ''
-    if (res.optimized_days?.length) {
-      showToast(`已调整其中 ${res.optimized_days.length} 天`)
-    } else if (res.ai_error) {
-      showToast(res.ai_error)
-    }
-  } catch {
-    // request.ts 已 toast 后端 message
-  } finally {
-    toast.close()
-    optimizing.value = false
+  if (!instruction || !trip.value || optimizing.value) return
+
+  // AI 重排走 writeDayPlan → clearDayItems → DELETE trip_items，
+  // 已打卡的记录会被【物理删掉】。有进度时先确认，不能静默清空用户走过的路。
+  if (checkedCount.value) {
+    showConfirmDialog({
+      title: '确认调整行程？',
+      message: `这次调整会重排整条行程，已打卡的 ${checkedCount.value} 项记录会被清空。`,
+      confirmButtonText: '继续调整',
+      cancelButtonText: '再想想',
+    })
+      .then(() => startOptimize(instruction))
+      .catch(() => {}) // 用户取消
+    return
   }
+  void startOptimize(instruction)
 }
+
+/** 真正发起 agent 会话（确认通过后） */
+function startOptimize(instruction: string) {
+  optimizing.value = true
+  agentSteps.value = []
+  agentReply.value = ''
+
+  agentController = streamTripAgent(
+    tripId.value,
+    instruction,
+    {
+      onStep: (s) => agentSteps.value.push(s),
+      onToken: (d) => { agentReply.value += d },
+      onDone: (e) => {
+        optimizing.value = false
+        agentController = null
+        // 记下这一轮，下一句追问才有上下文。答复为空（报错/超额度）时也要留用户的提问，
+        // 否则 AI 下一轮不知道自己刚被问过什么
+        agentHistory.value = [
+          ...agentHistory.value,
+          { role: 'user', text: instruction } as AgentTurn,
+          ...(agentReply.value.trim() ? [{ role: 'ai' as const, text: agentReply.value }] : []),
+        ].slice(-AGENT_HISTORY_LIMIT)
+        // 有写操作落库（AI 重排了行程）才重取详情，纯问天气不必白跑一趟
+        if (e.mutations.length) void reloadTripAfterAgent()
+        if (e.stop_reason !== 'done') showToast('本次没能完整处理，可以换个说法再试')
+      },
+      onError: () => {
+        optimizing.value = false
+        agentController = null
+        showToast('AI 服务暂时不可用，请稍后重试')
+      },
+      onAbort: () => {
+        optimizing.value = false
+        agentController = null
+      },
+    },
+    agentHistory.value,
+  )
+}
+
+/** 底部取消/停止/关闭：处理中就是中断，否则收面板 */
+function onOptCancel() {
+  if (optimizing.value) return agentController?.abort()
+  optOpen.value = false
+  agentSteps.value = []
+  agentReply.value = ''
+}
+
+/**
+ * agent 改完行程后重新拉【整套】页面数据。
+ *
+ * 不能只更新 trip.value 就完事：整条重排会删掉一批旧行程项，
+ * 而交通衔接是按 (行程|天) 缓存的（见 loadHops 的 hopKey 闸门）——
+ * 同一天重排后 key 不变，loadHops 会直接提前返回，衔接条就留着重排前的老数据。
+ * 所以先清掉 hopKey 让衔接强制重算，再走 load()：和「进入这个页面」完全同一条路径，
+ * 行程 / 天气 / 衔接 / 预算一次全刷，不另写一套逻辑免得日后各处漂移。
+ */
+async function reloadTripAfterAgent() {
+  selectedItemId.value = null // 选中的项可能已在这轮重排里被删掉
+  noSpot.value = []           // 重排后标题全变了，旧的「匹配不到」黑名单会让新项按钮被误隐藏
+  hopKey = ''                 // 失效衔接缓存，逼 loadHops 重新计算
+  await load()
+}
+
+// 关面板就中断在途请求，别让模型在后台继续烧额度
+watch(optOpen, (open) => {
+  if (!open && optimizing.value) agentController?.abort()
+})
+
+// 换行程要丢掉旧对话：详情页互跳时组件复用不重建，
+// 历史留着会把上一条行程的话题带进新行程，AI 会答非所问
+watch(tripId, () => {
+  agentHistory.value = []
+})
 
 const moreActions: { name: string; key: 'date' | 'people' }[] = [
   { name: '修改日期', key: 'date' },
@@ -1224,6 +1712,157 @@ async function onGenerateDay() {
 .walert__ic { flex-shrink: 0; display: flex; color: var(--c-brand); }
 .walert__ic :deep(svg) { width: 17px; height: 17px; }
 .dayhead__budget { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* ══════════════════════════════════════════════════════════
+   行中模式：今天
+   完成 = 翻篇（灰化），下一站 = 品牌色高亮。这个对比是整屏的视觉主线，
+   不额外引入新颜色 —— tokens 里没有专门的「成功绿」，
+   而且「已完成」用灰比用绿更贴语义（事情过去了，不是成就）。
+   ══════════════════════════════════════════════════════════ */
+.today { padding: 0 20px; }
+
+.today__head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 0 8px;
+  font-size: 12.5px; color: var(--c-sub);
+}
+.today__d { font-size: 15px; font-weight: 800; color: var(--c-text); }
+.today__date { color: var(--c-text); font-weight: 600; }
+.today__weather { display: inline-flex; align-items: center; gap: 3px; }
+.today__wicon { display: flex; color: var(--c-brand); }
+.today__wicon :deep(svg) { width: 15px; height: 15px; }
+/* 今天的出行日期/天气是核心信息，提醒条在这里要贴边对齐 .today 的内边距 */
+.today .walert { margin: 0 0 10px; }
+
+/* ---------- 进度 ---------- */
+.prog {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 14px;
+}
+.prog__track {
+  flex: 1; height: 5px;
+  background: var(--c-divider);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+.prog__fill {
+  display: block; height: 100%;
+  background: var(--c-brand);
+  border-radius: var(--radius-pill);
+  transition: width 0.25s ease;
+}
+.prog__text {
+  font-size: 12px; font-weight: 600; color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 下一站（整屏的主角） ---------- */
+.next {
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  background: var(--c-card);
+  border: 1px solid var(--c-brand-line);
+  border-left: 3px solid var(--c-brand);
+  border-radius: 12px;
+}
+.next__label {
+  margin: 0 0 6px;
+  font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+  color: var(--c-brand);
+}
+.next__title {
+  margin: 0;
+  font-size: 17px; font-weight: 700; line-height: 1.4;
+  color: var(--c-text);
+}
+.next__meta {
+  margin: 5px 0 0;
+  font-size: 12.5px; color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+}
+.next__btn {
+  width: 100%; height: 44px;
+  margin-top: 12px;
+  font-size: 15px; font-weight: 700; color: #fff;
+  background: var(--c-brand);
+  border: none; border-radius: 10px;
+  cursor: pointer;
+}
+.next__btn:active { opacity: 0.85; }
+
+/* ---------- 待办列表 ---------- */
+.tlist { display: flex; flex-direction: column; gap: 8px; }
+.titem {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+  background: var(--c-card);
+  border: 1px solid var(--c-divider);
+  border-radius: 12px;
+}
+.titem__body { flex: 1; min-width: 0; }
+.titem__title {
+  margin: 0;
+  font-size: 14px; font-weight: 600; line-height: 1.45;
+  color: var(--c-text);
+}
+.titem__meta {
+  margin: 4px 0 0;
+  font-size: 12px; color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+}
+/* 次要打卡按钮走描边：整屏多个实心按钮会吵，实心留给「下一站」 */
+.titem__check {
+  flex-shrink: 0;
+  height: 32px; padding: 0 14px;
+  font-size: 13px; font-weight: 600;
+  color: var(--c-brand);
+  background: transparent;
+  border: 1px solid var(--c-brand-line);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+}
+.titem__check:active { background: var(--c-brand-soft); }
+
+/* 已打卡：整条灰化，视觉上「翻篇」 */
+.titem--done { background: var(--c-bg); border-color: transparent; }
+.titem--done .titem__title { color: var(--c-sub); font-weight: 500; }
+.titem__check--undo {
+  color: var(--c-sub);
+  border-color: var(--c-divider);
+}
+
+/* 「已过时」：出发时间已过还没打卡，用强调色轻量提示，别做成报错 */
+.late {
+  display: inline-block;
+  margin-left: 6px; padding: 1px 6px;
+  font-size: 11px; font-weight: 600;
+  color: var(--c-accent);
+  background: var(--c-warn-soft);
+  border-radius: 4px;
+}
+
+/* ---------- 已完成折叠区 ---------- */
+.done { margin-top: 14px; }
+.done__head {
+  display: flex; align-items: center; justify-content: space-between;
+  width: 100%; padding: 10px 2px;
+  font-size: 12.5px; font-weight: 600; color: var(--c-sub);
+  background: transparent; border: none;
+  cursor: pointer;
+}
+.done .tlist { margin-top: 4px; }
+
+.today__empty {
+  padding: 28px 0;
+  text-align: center;
+  font-size: 13px; color: var(--c-sub);
+}
+.today__foot {
+  margin: 16px 0 0;
+  font-size: 13px; color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+}
+.today__foot em { font-style: normal; font-weight: 700; color: var(--c-money); }
 .dayhead__budget em { font-style: normal; font-weight: 700; color: var(--c-money); }
 
 /* ---------- 时间轴（编号节点 = logo 那条路的展开） ---------- */
@@ -1243,7 +1882,7 @@ async function onGenerateDay() {
   padding-top: 8px;
 }
 .tl__node {
-  width: 26px; height: 26px;
+  width: 22px; height: 22px;
   border-radius: 50%;
   display: grid; place-items: center;
   font-size: 11px; font-weight: 700;
@@ -1253,7 +1892,7 @@ async function onGenerateDay() {
   z-index: 1;
 }
 /* 三态保留「走到哪了」的信息：now 深青实底，past 浅青，next 白底描边 */
-.tl__node.now { box-shadow: 0 0 0 4px var(--c-brand-soft); }
+.tl__node.now { box-shadow: 0 0 0 3px var(--c-brand-soft); }
 .tl__node.past { background: var(--c-brand-soft); color: var(--c-brand-deep); }
 .tl__node.next { background: var(--c-card); color: var(--c-sub); border: 1.5px solid var(--c-divider); }
 .tl__line {
@@ -1292,14 +1931,30 @@ async function onGenerateDay() {
   left: 50%;
   border-left: 2px dashed var(--c-brand-line);
 }
-.hop__main { padding: 3px 2px; }
+.hop__main { padding: 3px 2px; box-sizing: border-box; }
 .hop__row {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   gap: 6px;
 }
-.hop__mode { font-size: 12px; font-weight: 700; color: var(--c-brand-deep); }
+/* 交通方式（图标 + 名称 + 下拉箭头）：可点，弹出切换面板 */
+.hop__mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--c-brand-deep);
+  cursor: pointer;
+}
+.hop__mode:active { opacity: 0.7; }
+.hop__mode :deep(.van-icon) { font-size: 10px; color: var(--c-brand-line); }
+.hop__ic { display: inline-flex; }
+.hop__ic :deep(svg) { width: 15px; height: 15px; }
 .hop__dest { font-size: 12px; font-weight: 700; color: var(--c-brand-deep); }
 .hop__meta { font-size: 12px; color: var(--c-sub); font-variant-numeric: tabular-nums; }
 .hop__cost { font-style: normal; font-weight: 700; color: var(--c-money); }
@@ -1310,6 +1965,101 @@ async function onGenerateDay() {
   line-height: 1.5;
   color: var(--c-muted);
 }
+
+/* 分步走法：动作图标沿细竖线串成导航式动线，比序号圆点更直观 */
+.hop__steps {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.hop__step {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+/* 除最后一步外，图标下方接一条细短线（连接动线） */
+.hop__step:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  left: 9px;
+  top: calc(50% + 8px);
+  width: 1px;
+  height: calc(100% - 2px);
+  background: var(--c-brand-line);
+}
+.hop__step-ic {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  color: var(--c-brand-deep);
+  z-index: 1;
+}
+.hop__step-ic :deep(svg) { width: 16px; height: 16px; }
+.hop__step-text {
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--c-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ---------- 交通方式切换面板（van-popup 底部弹层） ---------- */
+.hop-picker {
+  padding: 16px 18px calc(16px + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+.hop-picker__title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--c-sub);
+}
+.hop-picker__list { list-style: none; margin: 0; padding: 0; }
+.hop-picker__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 4px;
+  border-bottom: 1px solid var(--c-divider);
+  cursor: pointer;
+}
+.hop-picker__item:last-child { border-bottom: 0; }
+.hop-picker__item:active { opacity: 0.7; }
+.hop-picker__item.is-active .hop-picker__name { color: var(--c-brand); }
+.hop-picker__ic {
+  flex: none;
+  display: inline-flex;
+  color: var(--c-brand-deep);
+}
+.hop-picker__ic :deep(svg) { width: 20px; height: 20px; }
+.hop-picker__body { flex: 1; min-width: 0; }
+.hop-picker__name {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--c-text);
+}
+.hop-picker__meta {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+}
+/* 每个方式「怎么走」的说明：弱化小字，不抢方式名 */
+.hop-picker__tip {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--c-muted);
+}
+.hop-picker__check { font-size: 16px; color: var(--c-brand); }
 
 /* ---------- 行程卡片（紧凑型：时间 / 标题 / 标签 chips / 右侧价格） ---------- */
 .tl__card {
@@ -1360,21 +2110,6 @@ async function onGenerateDay() {
   box-shadow: var(--shadow-card), 0 0 0 3px var(--c-brand-soft);
 }
 .tl__lock { position: absolute; top: 8px; right: 8px; color: var(--c-brand); font-size: 16px !important; }
-
-/* ---------- AI 总结条 ---------- */
-.ai-sum {
-  display: flex;
-  gap: 8px;
-  align-items: flex-start;
-  margin: 4px 20px 0;
-  padding: 12px;
-  background: var(--c-brand-soft);
-  border-radius: 10px;
-}
-.ai-sum__ic { color: var(--c-brand); flex-shrink: 0; display: flex; }
-.ai-sum__ic svg { width: 16px; height: 16px; }
-.ai-sum p { font-size: 12.5px; line-height: 1.55; color: var(--c-brand-deep); }
-.ai-sum__cost { font-style: normal; font-weight: 700; color: var(--c-money); }
 
 /* ---------- 空当日兜底 ---------- */
 .tl--empty { min-height: 56px; }
@@ -1501,6 +2236,31 @@ async function onGenerateDay() {
 .opt__go { color: #fff; background: var(--c-brand); }
 .opt__cancel:disabled, .opt__go:disabled { opacity: 0.6; cursor: default; }
 
+/* agent 工具调用进度：把 AI 的「过程」外化，用户看得见它在查什么、改什么 */
+.opt__steps {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-bottom: 12px; padding: 10px 12px;
+  background: var(--c-brand-soft);
+  border-radius: 10px;
+}
+.opt__step {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; color: var(--c-brand-deep);
+}
+.opt__step .van-icon { color: var(--c-brand); }
+.opt__step-name { flex: 1; font-weight: 600; }
+.opt__step-state { font-size: 12px; color: var(--c-brand); opacity: 0.75; }
+.opt__step.is-fail, .opt__step.is-fail .van-icon { color: var(--c-sub); }
+.opt__step.is-fail .opt__step-state { color: var(--c-sub); opacity: 1; }
+
+/* agent 最终答复：与输入框区分开，读完不用再找输入位置 */
+.opt__reply {
+  margin: 0 0 12px; padding: 12px 14px;
+  font-size: 14px; line-height: 1.7; color: var(--c-text);
+  background: var(--c-bg); border-radius: 10px;
+  white-space: pre-wrap;
+}
+
 /* ---------- 选中项操作栏 ---------- */
 .item-actionbar {
   position: fixed;
@@ -1531,6 +2291,25 @@ async function onGenerateDay() {
   transition: all 0.15s;
 }
 .item-actionbar__btn :deep(.van-icon) { font-size: 16px; }
+/* 不可移动的方向直接置灰（把第二项上移会顶走「抵达」时，上移就灰掉） */
+.item-actionbar__btn:disabled {
+  color: var(--c-sub);
+  opacity: 0.45;
+  cursor: default;
+}
+/* 边界项的说明文案，占掉两个移动按钮的位置 */
+.item-actionbar__hint {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  height: 40px;
+  padding: 0 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--c-brand-deep);
+  background: var(--c-brand-soft);
+  border-radius: 10px;
+}
 .item-actionbar__btn--del { color: #ff4d4f; border-color: #ffccc7; background: #fff1f0; }
 .item-actionbar__btn--cancel { flex: 0 0 auto; padding: 0 16px; color: var(--c-sub); }
 .item-actionbar__btn:active { transform: scale(0.97); }
@@ -1576,7 +2355,7 @@ async function onGenerateDay() {
    排版纪律：一屏只回答一个问题，用 12px 小标题分节，不用卡片套卡片。
    品牌色只出现在「为什么值得去」这句主判断和最后一条溯源上，其余全是中性色 ——
    决策信息的重心是内容，不是装饰。 */
-.spot { padding: 18px 20px calc(env(safe-area-inset-bottom) + 20px); overflow-y: auto; }
+.spot { padding: 18px 20px calc(env(safe-area-inset-bottom) + 88px); overflow-y: auto; }
 .spot__head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .spot__city { font-size: 11.5px; color: var(--c-sub); letter-spacing: 0.04em; }
 .spot__title { margin-top: 2px; font-size: 19px; font-weight: 800; color: var(--c-text); letter-spacing: -0.01em; }

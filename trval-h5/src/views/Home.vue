@@ -2,15 +2,13 @@
   <div class="home">
     <!-- ① 状态栏 + 品牌（城市切换功能已下线，首页聚合 4 城内容） -->
     <header class="topbar">
-      <div class="topbar__left">
+      <div class="topbar__brand">
         <img class="brand-logo" src="/logo.svg" alt="途灵" />
         <span class="brand">途灵</span>
       </div>
     </header>
 
     <main class="body">
-      <!-- ② AI 入口 = 搜索框形态（大厂工具语言：携程问道/飞猪 AI 都是搜索框，不发光不渐变不解释）。
-           示例问句藏进 placeholder 轮播——界面不教用户，教学发生在输入框里 -->
       <section class="search" @click="focusNeed">
         <span class="search__spark" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none">
@@ -33,7 +31,16 @@
         </button>
       </section>
 
-      <!-- ⑥ 内容流 -->
+      <!-- ③ AI 能力入口：四个都进对话，其中三个带一句现成的问题。
+           首页不该有「点了不落到实处」的入口，所以只放对话真的答得好的能力 -->
+      <section class="caps">
+        <button v-for="c in caps" :key="c.key" class="cap" @click="onCap(c)">
+          <span class="cap__ic" v-html="c.icon"></span>
+          <span class="cap__label">{{ c.label }}</span>
+        </button>
+      </section>
+
+      <!-- ④ 内容流 -->
       <section class="stream">
         <header class="stream__head">
           <h3 class="stream__title">为你推荐</h3>
@@ -64,6 +71,8 @@
             <van-skeleton-image image-size="100%" class="pcard__skeleton-media" />
             <div class="pcard__body">
               <span class="skel skel-name"></span>
+              <span class="skel skel-desc"></span>
+              <span class="skel skel-tag"></span>
               <div class="pcard__foot">
                 <span class="skel skel-price"></span>
               </div>
@@ -83,7 +92,21 @@
               <van-icon v-else name="photo-o" class="pcard__media-ic" />
             </div>
             <div class="pcard__body">
-              <p class="pcard__name">{{ c.name }}</p>
+              <!-- ① 名称 + 评分 -->
+              <div class="pcard__title">
+                <p class="pcard__name">{{ c.name }}</p>
+                <span v-if="c.rating" class="pcard__rating">
+                  <van-icon name="star" class="pcard__rating-ic" />
+                  {{ c.rating }}
+                </span>
+              </div>
+              <!-- ② 描述一行（决策信息 · 截断） -->
+              <p v-if="c.description" class="pcard__desc">{{ c.description }}</p>
+              <!-- ③ 标签芯片 -->
+              <div v-if="c.tags?.length" class="pcard__tags">
+                <span v-for="t in c.tags" :key="t" class="pcard__tag">{{ t }}</span>
+              </div>
+              <!-- ④ 价格 + 报名人数 -->
               <div class="pcard__foot">
                 <p class="pcard__price">
                   <span v-if="c.price === '免费'" class="pcard__price-num">免费</span>
@@ -93,9 +116,8 @@
                     <span class="pcard__price-unit">人均</span>
                   </template>
                 </p>
-                <span v-if="c.rating" class="pcard__rating">
-                  <van-icon name="star" class="pcard__rating-ic" />
-                  {{ c.rating }}
+                <span v-if="c.enrollment" class="pcard__enroll">
+                  {{ c.enrollment > 999 ? Math.round(c.enrollment / 1000) + 'k' : c.enrollment }} 人已报名
                 </span>
               </div>
             </div>
@@ -175,6 +197,49 @@ const phTimer = window.setInterval(() => {
   phIndex.value = (phIndex.value + 1) % phs.length
 }, 3200)
 onUnmounted(() => clearInterval(phTimer))
+
+/* ④ AI 能力入口
+   ─────────────────────────────────────────────────────
+   图标统一 24x24 线性、stroke=currentColor、1.6 线宽、圆角端点 ——
+   与行程页的天气图标、时间轴编号同一套语言（原金刚区下线后这套规范沿用）。
+
+   四个入口都指向 /chat，只是各带一句现成的问题。理由：
+   这个 App 的真实落点只有 /chat、/trip、/message、/profile，后三个已经在
+   底部 tab 里了，首页再摆一遍就是纯重复；而这四个解决的是「不知道怎么问」，
+   顺带把 AI 会干什么演示给用户 —— 那是首页该承担的职责。
+
+   刻意【不做】「问天气」「算预算」这类入口：对话接口没有工具、也不带行程上下文，
+   问天气模型只能凭记忆瞎答（真实天气只在行程页的 agent 里，由 Open-Meteo 提供），
+   预算同理要挂在具体行程上。宁可少两个图标，也不给一个会答错的入口。 */
+const ICON_SPARK =
+  '<svg viewBox="0 0 24 24" fill="none"><path d="M12 3l1.9 5.6a1 1 0 0 0 .63.63L20.2 11l-5.67 1.77a1 1 0 0 0-.63.63L12 19l-1.9-5.6a1 1 0 0 0-.63-.63L3.8 11l5.67-1.77a1 1 0 0 0 .63-.63L12 3Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>'
+const ICON_FOOD =
+  '<svg viewBox="0 0 24 24" fill="none"><path d="M4.5 12.5h15a7.5 7.5 0 0 1-15 0Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M9.8 8.9c0-1.3 1-2.3 2.2-2.3s2.2 1 2.2 2.3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>'
+const ICON_SIGHT =
+  '<svg viewBox="0 0 24 24" fill="none"><circle cx="8" cy="6.8" r="2.3" stroke="currentColor" stroke-width="1.6"/><path d="M2.8 19.5h18.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M4.6 19.5L12 7.6l7.4 11.9" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>'
+/* 路：两条透视边线 + 中间虚线，呼应 logo 里那条路 */
+const ICON_ROAD =
+  '<svg viewBox="0 0 24 24" fill="none"><path d="M7.5 21L9.5 3M16.5 21L14.5 3" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M12 4.5v2.6M12 10.7v2.6M12 16.9v2.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>'
+
+interface Cap {
+  key: string
+  label: string
+  icon: string
+  /** 带进对话的问题；空串表示不预填，让用户自己说去哪儿、玩几天 */
+  q: string
+}
+
+const caps: Cap[] = [
+  { key: 'plan', label: 'AI 规划', icon: ICON_SPARK, q: '' },
+  { key: 'food', label: '找美食', icon: ICON_FOOD, q: '有什么必吃的美食推荐？' },
+  { key: 'sight', label: '看景点', icon: ICON_SIGHT, q: '有哪些值得去的景点？' },
+  { key: 'traffic', label: '问交通', icon: ICON_ROAD, q: '景点之间怎么走比较顺？' },
+]
+
+function onCap(c: Cap) {
+  // 不预填的入口（AI 规划）只把用户送进对话：去哪儿、玩几天得他自己说才准
+  router.push(c.q ? { path: '/chat', query: { q: c.q } } : { path: '/chat' })
+}
 </script>
 
 <style scoped>
@@ -197,7 +262,10 @@ onUnmounted(() => clearInterval(phTimer))
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  /* 品牌（logo + 途灵）居中。原来是 space-between，但顶栏只有这一个子元素，
+     等于靠左。以后若要在右侧加动作（如铃铛），这里得改回 space-between 并用
+     两侧等宽的占位撑住，否则中间那组会偏 */
+  justify-content: center;
   padding: calc(env(safe-area-inset-top) + 8px) 20px 4px;
   background: var(--c-bg);
   position: sticky;
@@ -210,7 +278,7 @@ onUnmounted(() => clearInterval(phTimer))
   color: var(--c-brand-deep);
   letter-spacing: 0.04em;
 }
-.topbar__left {
+.topbar__brand {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -226,7 +294,11 @@ onUnmounted(() => clearInterval(phTimer))
 /* ---------- ② AI 入口 = 搜索框（描边打底 + 灵光呼吸 · 与 tabbar AI 圆钮同源） ---------- */
 .search {
   position: relative;        /* 灵光伪元素的定位父级 */
-  margin-top: 14px;
+  /* 26px 是为了给光晕让出空间：--glow-halo-bar 是 `0 0 22px 2px`，
+     最多向 border-box 外扩 24px。原来只留 14px，顶部那截就落进了
+     顶栏的区域 —— 顶栏是 sticky + 实色底 + z-index:10，直接把它盖住了。
+     要让搜索框+四个图标整体往下挪，就动这一个值（下面的 .stream 会同步抵消）。 */
+  margin-top: 26px;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -317,8 +389,51 @@ onUnmounted(() => clearInterval(phTimer))
 .search__btn:active { transform: scale(0.94); }
 .search__btn svg { width: 18px; height: 18px; }
 
+/* ---------- ③ AI 能力入口 ----------
+   四等分铺满内容宽，与搜索框、内容流左右对齐。
+   描边 + 白底，与内容流卡片同一套分层语言（--radius-card 16px 与 .pcard 对齐）；
+   品牌色只落在 24px 的图标上，控制在 15% 品牌层里，不给整块上色 */
+.caps {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  /* 左右不能再写 20px：.caps 在 .body 里，而 .body 已经有 padding 0 20px，
+     再加一次就变成内缩 40px，和搜索框、内容流对不齐了（原来写错过） */
+  margin: 14px 0 0;
+}
+.cap {
+  /* 显式声明 box-sizing：项目里没有全局重置，写死边框盒可以让每张卡的实际宽度
+     严格等于 1fr 那一栏（否则 padding 算在栏外，四张会多出 32px） */
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 13px 4px 11px;
+  background: var(--c-card);
+  border: 1px solid var(--c-divider);
+  border-radius: var(--radius-card);
+  transition: transform 0.15s var(--ease-motion);
+}
+.cap:active { transform: scale(0.96); }
+.cap__ic {
+  display: flex;
+  color: var(--c-brand);
+}
+/* v-html 进来的 svg 拿不到 scoped 属性，必须 :deep 才能约束尺寸 */
+.cap__ic :deep(svg) { width: 24px; height: 24px; }
+.cap__label {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--c-text);
+  white-space: nowrap;
+}
+
 /* ---------- ④ 内容流 ---------- */
-.stream { margin-top: 26px; }
+/* 26 → 14：搜索框上边距加了 12px，这里就得减 12px，
+   这样「为你推荐」的绝对位置纹丝不动（上移的只有搜索框和四个图标）。
+   代价是四个图标与「为你推荐」之间的间隔从 26px 收到 14px。 */
+.stream { margin-top: 14px; }
 .stream__head {
   display: flex; align-items: center; justify-content: space-between;
   margin-bottom: 10px;
@@ -438,13 +553,46 @@ onUnmounted(() => clearInterval(phTimer))
   filter: saturate(0.96) contrast(1.04); /* 与主视觉同一套调色 */
 }
 .pcard__body { padding: 10px 12px 12px; }
+.pcard__title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
 .pcard__name {
   font-size: 14.5px; font-weight: 600;
   color: var(--c-text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  min-width: 0;
 }
+/* ② 描述一行：轻字号灰字，决策信息，截断为一行 */
+.pcard__desc {
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--c-sub);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* ③ 标签芯片一行：小字描边 chip，密而克制 */
+.pcard__tags {
+  margin-top: 8px;
+  display: flex;
+  gap: 6px;
+  overflow: hidden;
+}
+.pcard__tag {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  line-height: 1;
+  color: var(--c-brand-deep);
+  background: var(--c-brand-soft);
+  padding: 3px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+/* ④ 价格 + 报名人数 */
 .pcard__foot {
-  margin-top: 7px;
+  margin-top: 8px;
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -465,6 +613,14 @@ onUnmounted(() => clearInterval(phTimer))
   color: var(--c-sub);
   margin-left: 2px;
 }
+.pcard__enroll {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--c-sub);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .pcard__rating {
   flex-shrink: 0;
   display: inline-flex;
@@ -478,9 +634,11 @@ onUnmounted(() => clearInterval(phTimer))
   font-size: 11.5px !important;
   color: var(--c-accent);
 }
-/* 骨架占位 */
+/* 骨架占位：对齐新 4 行结构 */
 .skel-name { width: 62%; height: 13px; border-radius: 3px; }
-.skel-price { width: 56px; height: 16px; border-radius: 3px; margin-top: 7px; }
+.skel-desc { display: block; margin-top: 6px; width: 96%; height: 11px; border-radius: 3px; }
+.skel-tag { display: block; margin-top: 8px; width: 44%; height: 16px; border-radius: 4px; }
+.skel-price { width: 56px; height: 16px; border-radius: 3px; margin-top: 8px; }
 
 /* ---------- 骨架屏 ---------- */
 @keyframes skel-shimmer {

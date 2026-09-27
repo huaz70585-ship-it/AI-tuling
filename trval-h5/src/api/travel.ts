@@ -75,17 +75,17 @@ export interface TripItem {
   ai_confidence: number | null
   note: string
   /**
-   * 地理编码结果（GCJ-02，由后端 geo.js 回填）。
-   * 可选：后端未回填、或该项本身是抽象项（抵达/返程）时都可能缺失。
-   * 只有 latitude / longitude 同时是数字才可以打点。
+   * 打卡时间戳（行中模式）。null = 还没去过。
+   * 是时间戳而不是布尔量：既能判断去没去过，也能显示几点去的。
    */
-  latitude?: number | null
-  longitude?: number | null
-  geo_status?: TripGeoStatus | null
+  done_at: string | null
+  /**
+   * 边界项标记：arrival = 抵达（固定在当天首位）/ closing = 返程（固定在末位）/ null = 普通项。
+   * 由后端按标题语义判定（与移动接口的拦截同一口径），前端只读不算 ——
+   * 正则只留后端一份，避免两边各写一套导致「前端说能拖、后端拒绝」。
+   */
+  boundary: 'arrival' | 'closing' | null
 }
-
-/** 地理编码状态：ok=已定位 / miss=查无此实体 / city_mismatch=查到但不在同省 */
-export type TripGeoStatus = 'ok' | 'miss' | 'city_mismatch'
 
 /** GET /v1/trip/{id} 全量拉取：trip + days[]（每层含 items[]） */
 export interface TripDetail extends Trip {
@@ -226,8 +226,16 @@ export async function getTripDetail(id: string): Promise<TripDetail> {
   }
 }
 
-/** 保存 AI 生成的行程（POST /v1/trips：title + days 摘要数组） */
-export function saveTrip(params: { title: string; days: string[] }): Promise<{ id: string }> {
+/**
+ * 保存 AI 生成的行程（POST /v1/trips：title + start_date + days 摘要数组）。
+ * start_date 是 AI 按用户说的日期推算出来的（YYYY-MM-DD）；
+ * 后端会兜底校验（缺失/格式错/早于今天 一律收敛到今天），所以这里原样透传即可。
+ */
+export function saveTrip(params: {
+  title: string
+  days: string[]
+  start_date?: string
+}): Promise<{ id: string }> {
   return request<{ id: string }>({ url: '/v1/trips', method: 'POST', data: params })
 }
 
@@ -262,6 +270,23 @@ export function moveTripItem(
   })
 }
 
+/**
+ * 行中打卡 / 撤销打卡（POST /v1/trip/:id/item/:itemId/check）。
+ * 后端幂等、不带乐观锁（自己点自己不冲突），所以可以放心乐观更新。
+ * 只标状态、不改价格，不触发预算重算。
+ */
+export function checkTripItem(
+  tripId: string,
+  itemId: string,
+  done: boolean,
+): Promise<{ id: string; done_at: string | null }> {
+  return request<{ id: string; done_at: string | null }>({
+    url: `/v1/trip/${tripId}/item/${itemId}/check`,
+    method: 'POST',
+    data: { done },
+  })
+}
+
 /** 修改日期 / 出行人数（PATCH /v1/trip/:id）
  *  乐观锁：必须带 If-Match: revision，revision 不一致后端返回 409
  *  注意：日期变长时后端会为新多出来的天调 AI 补排行程（耗时数秒），
@@ -290,17 +315,12 @@ export function generateTripDay(id: string, dayIndex: number): Promise<TripDetai
 }
 
 /** 整条行程按「口语要求」优化（POST /v1/trip/:id/optimize）
- *  例：instruction = '这里购物太多，把购物日换成亲子项目'。
- *  后端把整条行程喂给 AI 重排并逐天落库，响应 optimized_days 标出改了哪些天。 */
-export function optimizeTrip(id: string, instruction: string): Promise<TripDetail> {
-  return request<TripDetail>({
-    url: `/v1/trip/${id}/optimize`,
-    method: 'POST',
-    data: { instruction },
-  })
-}
+ *  已被 api/agent.ts 的 streamTripAgent 取代：现在由 AI 自己决定要不要重排行程，
+ *  前端不再直接调这个接口。后端接口保留（agent 的 optimize_trip 工具复用其 prompt）。 */
 
-function addDays(iso: string, n: number): string {
+/** YYYY-MM-DD 加 n 天（UTC 正午锚点，规避时区偏移）。
+ *  导出给 Chat.vue 用：行程卡片要靠它算出结束日、把日期范围显示给用户核对 */
+export function addDays(iso: string, n: number): string {
   const d = new Date(`${iso}T12:00:00`)
   d.setDate(d.getDate() + n)
   return d.toISOString().slice(0, 10)
@@ -370,6 +390,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '09:00', duration_min: 50,
             price_ref: 0, price_snapshot: null,
             locked: false, source: 'ai', ai_confidence: 0.92, note: '',
+            done_at: null,
+            boundary: 'arrival',
           },
           {
             id: '9002', trip_id: '1001', trip_day_id: '1001-d1', sort_order: 2,
@@ -378,6 +400,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '10:30', duration_min: 30,
             price_ref: 0, price_snapshot: null,
             locked: false, source: 'ai', ai_confidence: 0.55, note: 'AI 时间为估算，请核对',
+            done_at: null,
+            boundary: null,
           },
           {
             id: '9003', trip_id: '1001', trip_day_id: '1001-d1', sort_order: 3,
@@ -386,6 +410,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '12:30', duration_min: 60,
             price_ref: 180, price_snapshot: { amount: 180, currency: 'CNY', captured_at: '2026-09-22T09:30:00+08:00' },
             locked: true, source: 'user', ai_confidence: null, note: '',
+            done_at: null,
+            boundary: null,
           },
           {
             id: '9004', trip_id: '1001', trip_day_id: '1001-d1', sort_order: 4,
@@ -394,6 +420,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '15:00', duration_min: 120,
             price_ref: 40, price_snapshot: null,
             locked: false, source: 'ai', ai_confidence: 0.48, note: '午后客流高峰，建议改期或提前购票',
+            done_at: null,
+            boundary: null,
           },
         ],
       },
@@ -409,6 +437,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '08:30', duration_min: 600,
             price_ref: 475, price_snapshot: { amount: 475, currency: 'CNY', captured_at: '2026-09-22T09:30:00+08:00' },
             locked: true, source: 'user', ai_confidence: null, note: '',
+            done_at: null,
+            boundary: null,
           },
           {
             id: '9102', trip_id: '1001', trip_day_id: '1001-d2', sort_order: 2,
@@ -417,6 +447,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '19:00', duration_min: null,
             price_ref: 680, price_snapshot: { amount: 680, currency: 'CNY', captured_at: '2026-09-22T09:30:00+08:00' },
             locked: true, source: 'system', ai_confidence: null, note: '',
+            done_at: null,
+            boundary: null,
           },
         ],
       },
@@ -432,6 +464,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '10:00', duration_min: 150,
             price_ref: 0, price_snapshot: null,
             locked: false, source: 'ai', ai_confidence: 0.85, note: '',
+            done_at: null,
+            boundary: null,
           },
           {
             id: '9202', trip_id: '1001', trip_day_id: '1001-d3', sort_order: 2,
@@ -440,6 +474,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '14:00', duration_min: 60,
             price_ref: 60, price_snapshot: null,
             locked: false, source: 'ai', ai_confidence: 0.62, note: '时间为估算',
+            done_at: null,
+            boundary: null,
           },
         ],
       },
@@ -455,6 +491,8 @@ const MOCK_TRIP_DETAILS: Record<string, TripDetail> = {
             cover_url: null, start_time: '13:00', duration_min: null,
             price_ref: 0, price_snapshot: null,
             locked: false, source: 'ai', ai_confidence: 0.9, note: '',
+            done_at: null,
+            boundary: 'closing',
           },
         ],
       },
