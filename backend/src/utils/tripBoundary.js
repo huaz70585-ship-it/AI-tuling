@@ -14,22 +14,11 @@
  * 它含真实地名、能算交通，但仍然是「行程第一天」的标记。
  */
 import { queryAll, queryOne, run } from '../db.js'
+// 边界项的判定（正则）已抽到 utils/boundary.js —— db.js 与 routes/trip.js 也要用，
+// 放这里会让 db.js 反过来 import 本模块，形成循环
+import { isArrivalItem, isClosingItem } from './boundary.js'
 
-/** 收尾动作：只在行程最后一天成立 */
-const CLOSING_ITEM =
-  /(返程|回程|返家|返京|返沪|返杭|返穗|返深|返津|返渝|返蓉|返邕|返汉|返长|离程|送机|送站|去机场|去火车站|去高铁站|散团|行程结束|结束行程)/
-
-/**
- * 抵达动作：只在行程第一天成立。
- *
- * 必须锚定开头，且刻意【不收「入住」】—— 「入住 · 陆家嘴精品酒店」在 1001 里就落在
- * 第 2 天，那是正常的住宿动作，不是边界标记（连住几晚会重复出现）。踩过这个坑。
- * 末尾的负向断言再挡一层：第 N 天的「抵达酒店」不是「抵达目的地」。
- */
-const ARRIVAL_ITEM = /^(抵达|到达|飞抵|落地|初到)(?!酒店|宾馆|民宿|住处|客栈)/
-
-export const isClosingItem = (title) => CLOSING_ITEM.test(String(title || ''))
-export const isArrivalItem = (title) => ARRIVAL_ITEM.test(String(title || ''))
+export { isArrivalItem, isClosingItem }
 
 /**
  * 找出所有「位置与语义不符」的行程项。

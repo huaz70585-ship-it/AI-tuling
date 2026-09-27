@@ -3,6 +3,9 @@ import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import dotenv from 'dotenv'
+// 边界项判定（纯函数、无依赖）：mapItem 要给前端标出抵达/返程，
+// 前端据此不给移动入口。放 utils/boundary.js 而非 tripBoundary.js 是为了避免循环 import
+import { isArrivalItem, isClosingItem } from './utils/boundary.js'
 
 dotenv.config()
 
@@ -92,6 +95,8 @@ CREATE TABLE IF NOT EXISTS trip_hops (
   duration_min INTEGER,                            -- 纯在途分钟数（不含等待）
   cost_ref     INTEGER,                            -- 每人预估花费（元）
   tip          TEXT NOT NULL DEFAULT '',
+  alts         TEXT NOT NULL DEFAULT '[]',         -- JSON: 备选交通方式（mode/duration_min/cost_ref/tip/steps）
+  steps        TEXT NOT NULL DEFAULT '[]',         -- JSON: 主选方式的详细分步走法（坐几号线/换乘/哪站下/哪个口）
   source       TEXT NOT NULL DEFAULT 'ai',         -- ai/map
   created_at   TEXT NOT NULL,
   UNIQUE (from_item_id, to_item_id),
@@ -223,6 +228,9 @@ function addColumnIfMissing(table, column, definition) {
 addColumnIfMissing('users', 'username', 'TEXT')
 addColumnIfMissing('users', 'password', 'TEXT')
 addColumnIfMissing('cities', 'hero_image', 'TEXT')
+// 交通衔接缓存：老库没有备选交通列，补上（纯缓存，失败静默）
+addColumnIfMissing('trip_hops', 'alts', "TEXT NOT NULL DEFAULT '[]'")
+addColumnIfMissing('trip_hops', 'steps', "TEXT NOT NULL DEFAULT '[]'")
 addColumnIfMissing('cities', 'tagline', 'TEXT')
 addColumnIfMissing('city_spots', 'rating', 'REAL')
 addColumnIfMissing('city_spots', 'tags', "TEXT NOT NULL DEFAULT '[]'")
@@ -240,6 +248,13 @@ addColumnIfMissing('cities', 'longitude', 'REAL')
 addColumnIfMissing('trip_items', 'latitude', 'REAL')
 addColumnIfMissing('trip_items', 'longitude', 'REAL')
 addColumnIfMissing('trip_items', 'geo_status', 'TEXT')
+
+// 行中模式（2026-09-25 起）：打卡时间戳，NULL = 还没去过。
+// 用时间戳而不是 done 布尔量：一个字段同时承载「去没去过」和「几点去的」，
+// 将来做行程回放 / 足迹统计也用得上，不必再加列。
+// 与 locked 的区别：locked 是「已预订，别让 AI 改」，done_at 是「我去过了」，
+// 两个维度，不能混用。
+addColumnIfMissing('trip_items', 'done_at', 'TEXT')
 
 // 景点决策信息（2026-09-25 起）：把「只显示名字」升级成「给用户决策依据」。
 // 为什么是 JSON 而不是平铺 20 列：这些是【叙事型】字段（why_go / avoid / photo…），
@@ -379,6 +394,14 @@ function mapItem(i) {
     source: i.source,
     ai_confidence: i.ai_confidence,
     note: i.note,
+    /** 打卡时间戳（行中模式），NULL = 未打卡 */
+    done_at: i.done_at,
+    /**
+     * 边界项标记：arrival = 抵达（固定在当天首位）/ closing = 返程（固定在末位）/ null = 普通项。
+     * 前端据此不给上移/下移入口。判定口径与 routes/trip.js 的移动拦截同源
+     * （utils/boundary.js），前端只读不算 —— 正则只留一份，不再两边各写一套。
+     */
+    boundary: isArrivalItem(i.title) ? 'arrival' : isClosingItem(i.title) ? 'closing' : null,
     // 地理编码结果（2026-09-24 起）：坐标由 geo.js 回填，是 GCJ-02（火星坐标）。
     // geo_status 取值 ok / miss / city_mismatch / null（未解析，含抽象项）。
     // 前端地图只在 latitude/longitude 同时非空时打点。

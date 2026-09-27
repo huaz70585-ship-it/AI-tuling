@@ -59,6 +59,37 @@ export function dayFormatRules() {
 }
 
 /**
+ * 首尾边界项的写法规则（抵达 / 返程）。
+ *
+ * 为什么必须抽出来、且必须显式写进规则：
+ * 「抵达」以前【只出现在 chat.js 的示例句里】，从来没写成一条规则 ——
+ * 于是模型照抄示例时才有「Day1 抵达成都」，没照抄就直接第一站，
+ * 同一批生成里时有时无，用户一眼就看得出不一致。规则不能只活在示例里。
+ *
+ * 与 §格式规则 放一起（而不是塞进编号任务规则）：它约束的是"摘要长什么样"，
+ * 和「名称（价格）」是同一类要求；而且各调用方的编号列表长度不同，混进去会乱。
+ *
+ * @param {boolean} isFirstDay 本次生成是否覆盖行程第一天
+ * @param {boolean} isLastDay  本次生成是否覆盖行程最后一天
+ */
+export function boundaryRules(isFirstDay, isLastDay) {
+  const lines = []
+  if (isFirstDay) {
+    lines.push(
+      '- 【强制】第一天必须以「抵达+目的地（免费）」开头，例如「Day1 抵达成都（免费）+宽窄巷子（免费）」。注意「抵达酒店 / 抵达民宿」是住宿动作、不是抵达目的地，不能拿它当开场；',
+    )
+  } else {
+    lines.push('- 【禁止】本次不涉及第一天，不得出现「抵达」「到达」「飞抵」「落地」这类开场安排；')
+  }
+  if (isLastDay) {
+    lines.push('- 【强制】最后一天必须以「返程（免费）」收尾（用户明确要求去掉时才不写）；')
+  } else {
+    lines.push('- 【禁止】本次不涉及最后一天，不得出现「返程」「回程」「送机」「送站」这类收尾安排；')
+  }
+  return lines.join('\n')
+}
+
+/**
  * 一行「已有安排」：`D1 灵隐寺（45）+飞来峰（含于票价）`
  *
  * 必须剥掉存的标题里自带的 "Day1 " 前缀，否则拼出来是「D1 Day1 灵隐寺…」，
@@ -91,14 +122,17 @@ export function buildAppendDaysMessages({ title, totalDays, existingDays, target
     '\n1. 只输出 JSON，不要任何解释文字，不要输出 markdown 代码块以外的内容。',
     '\n2. 输出格式严格为：{"days":["Day2 ...","Day3 ..."]}',
     `\n3. days 数组长度必须等于「需要补排的天数」，顺序与给出的日期先后一致，Day 序号用给出的真实序号。`,
-    '\n4. 每天 3-4 个项目，项目之间用 + 连接。',
+    '\n4. 每天项目数不固定、按景点大小和当天剩余时间弹性安排（大景区占半天就别凑数，同片区小点位可凑2个）；项目之间用 + 连接。',
     '\n5. 【必须避开】「已排好的天数」里已经出现过的景点，并延续它的节奏与主题。',
     '\n6. 不要重复输出已排好的那几天。',
-    targets.some((t) => t.day_index === totalDays)
-      ? '\n7. 补排的这几天包含整个行程的最后一天，最后一天请以「返程（免费）」收尾。'
-      : '',
     '\n\n格式规则：\n',
     dayFormatRules(),
+    '\n',
+    // 补排只加在末尾，所以永远不会覆盖第一天；是否覆盖最后一天看 targets
+    boundaryRules(
+      false,
+      targets.some((t) => t.day_index === totalDays),
+    ),
   ].join('')
 
   const existing = existingDays.length
@@ -163,11 +197,11 @@ export function buildRefillDayMessages({
       ? `\n3. 这一天【已有安排】：${keep}。必须原样保留这些项目（名称、价格括号、先后顺序都不变），只在它们后面追加 ${need} 个新项目。绝对不要删掉或改写已有项目。`
       : '\n3. 这一天目前是空的，请排 3-4 个项目。',
     '\n4. 新项目要延续这趟行程的主题与节奏，并且【不能】是其它天已经安排过的景点。',
-    isLastDay
-      ? '\n5. 这一天是整条行程的最后一天，最后请以「返程（免费）」收尾。'
-      : `\n5. 这一天是第 ${dayIndex} 天（整条行程共 ${totalDays} 天），【不是】最后一天，绝对不要出现「返程」「回程」「送机」「送站」这类收尾安排。`,
     '\n\n格式规则：\n',
     dayFormatRules(),
+    '\n',
+    // 单天重排会整版覆盖这一天，所以它自己是不是首/末天决定要不要写抵达/返程
+    boundaryRules(dayIndex === 1, isLastDay),
   ].join('')
 
   const siblings = existingDays.length
@@ -215,9 +249,11 @@ export function buildOptimizeTripMessages({ title, totalDays, existingDays, inst
     '\n3. 每天 3-4 个项目，项目之间用 + 连接。',
     `\n4. 只按用户的调整要求改动；用户没要求动的天，尽量保留原有安排（只做必要的最小调整，如顺延时间线）。不要整天整天空降与要求无关的新景点。`,
     '\n5. 调整要延续这趟行程的主题与节奏，新景点尽量从合作城市景点里选，不要与要求无关地重复已有项目。',
-    '\n6. 最后一天以「返程（免费）」收尾（除非用户明确要求去掉）。',
     '\n\n格式规则：\n',
     dayFormatRules(),
+    '\n',
+    // 整条优化会重写每一天，首尾都覆盖得到
+    boundaryRules(true, true),
   ].join('')
 
   const existing = existingDays.length
