@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { queryAll, run } from '../db.js'
-import { ok } from '../utils/response.js'
+import { ok, err } from '../utils/response.js'
 import { authMiddleware } from '../utils/auth.js'
 
 const router = Router()
@@ -36,6 +36,30 @@ router.get('/messages', (req, res) => {
 router.patch('/messages/read-all', (req, res) => {
   run('UPDATE messages SET unread = 0 WHERE user_id = ? AND unread = 1', [req.user.id])
   ok(res, null, '已全部标为已读')
+})
+
+/** PATCH /v1/messages/:id/read  单条已读（点击消息卡片时调用） */
+router.patch('/messages/:id/read', (req, res) => {
+  const { id } = req.params
+  const row = queryAll('SELECT id FROM messages WHERE id = ? AND user_id = ?', [id, req.user.id])
+  if (!row.length) return err(res, '消息不存在', 404)
+  run('UPDATE messages SET unread = 0 WHERE id = ? AND user_id = ?', [id, req.user.id])
+  ok(res, null, '已标为已读')
+})
+
+/** DELETE /v1/messages/:id  删除单条消息（左滑删除） */
+router.delete('/messages/:id', (req, res) => {
+  const { id } = req.params
+  const row = queryAll('SELECT id FROM messages WHERE id = ? AND user_id = ?', [id, req.user.id])
+  if (!row.length) return err(res, '消息不存在', 404)
+  run('DELETE FROM messages WHERE id = ? AND user_id = ?', [id, req.user.id])
+  ok(res, { id })
+})
+
+/** DELETE /v1/messages  一键清空当前用户的全部消息（前端二次确认后调用） */
+router.delete('/messages', (req, res) => {
+  run('DELETE FROM messages WHERE user_id = ?', [req.user.id])
+  ok(res, null, '消息已清空')
 })
 
 /** GET /v1/messages/unread-count  未读数 */

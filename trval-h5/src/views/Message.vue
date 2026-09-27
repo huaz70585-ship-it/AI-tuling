@@ -3,7 +3,8 @@
     <!-- 顶栏：消息中心 + 全部已读（tab 落地页，无返回箭头，与行程列表页一致） -->
     <van-nav-bar fixed placeholder title="消息中心">
       <template #right>
-        <span class="read-all" @click="readAll">全部已读</span>
+        <span class="nav-act" @click="readAll">全部已读</span>
+        <span class="nav-act nav-act--danger" @click="onClearAll">清空</span>
       </template>
     </van-nav-bar>
 
@@ -21,48 +22,60 @@
       </button>
     </div>
 
-    <!-- 消息列表 · 按时间分组 -->
-    <main class="list">
-      <template v-for="g in groups" :key="g.label">
-        <div v-if="g.items.length" class="group">
-          <p class="group__label">{{ g.label }}</p>
-          <article
-            v-for="m in g.items"
-            :key="m.id"
-            class="item"
-            :class="{ 'is-unread': m.unread, [`is-${m.type}`]: true }"
-          >
-            <div class="item__avatar" :style="{ background: m.iconBg }">
-              <van-icon :name="m.icon" />
-              <span v-if="m.unread" class="item__dot"></span>
-            </div>
-            <div class="item__body">
-              <div class="item__head">
-                <p class="item__title">{{ m.title }}</p>
-                <span class="item__time">{{ m.time }}</span>
-              </div>
-              <p class="item__preview">{{ m.preview }}</p>
-              <button
-                v-if="m.cta"
-                class="item__cta"
-                :class="`cta--${m.cta.kind}`"
-                @click="onCta(m)"
-              >{{ m.cta.label }}</button>
-            </div>
-          </article>
-        </div>
-      </template>
+    <!-- 消息列表 · 按时间分组（下拉刷新拉取最新） -->
+    <van-pull-refresh v-model="refreshing" @refresh="onRefresh">
+      <main class="list">
+        <template v-for="g in groups" :key="g.label">
+          <div v-if="g.items.length" class="group">
+            <p class="group__label">{{ g.label }}</p>
+            <van-swipe-cell v-for="m in g.items" :key="m.id" class="msg-cell">
+              <article
+                class="item"
+                :class="{ 'is-unread': m.unread, [`is-${m.type}`]: true }"
+                @click="onItem(m)"
+              >
+                <div class="item__avatar" :style="{ background: avatarBg(m.type) }">
+                  <van-icon :name="m.icon" />
+                  <span v-if="m.unread" class="item__dot"></span>
+                </div>
+                <div class="item__body">
+                  <div class="item__head">
+                    <p class="item__title">{{ m.title }}</p>
+                    <span class="item__time">{{ relTime(m.createdAt) }}</span>
+                  </div>
+                  <p class="item__preview">{{ m.preview }}</p>
+                  <button
+                    v-if="m.cta"
+                    class="item__cta"
+                    :class="`cta--${m.cta.kind}`"
+                    @click.stop="onItem(m)"
+                  >{{ m.cta.label }}</button>
+                </div>
+              </article>
+              <template #right>
+                <button class="item__del" @click.stop="onDelete(m)">删除</button>
+              </template>
+            </van-swipe-cell>
+          </div>
+        </template>
 
-      <p class="end-tip">没有更多消息了</p>
-    </main>
+        <!-- 空状态：没消息时替代时间分组和结束语 -->
+        <div v-if="!messages.length" class="empty">
+          <van-icon name="bell-o" class="empty__ic" />
+          <p class="empty__title">暂无消息</p>
+          <p class="empty__desc">行程保存、系统通知会出现在这里</p>
+        </div>
+        <p v-else class="end-tip">没有更多消息了</p>
+      </main>
+    </van-pull-refresh>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { showToast } from 'vant'
-import { getMessages, readAllMessages, type Message } from '../api/message'
+import { showToast, showConfirmDialog } from 'vant'
+import { getMessages, readAllMessages, readMessage, deleteMessage, clearAllMessages, type Message } from '../api/message'
 
 const router = useRouter()
 
@@ -85,6 +98,23 @@ const cats: { key: CatKey; label: string }[] = [
 const activeCat = ref<CatKey>('all')
 
 /**
+ * 头像底色按类型派生（不信任后端 iconBg）——类型即视觉，四种类型一眼分辨：
+ *   · 交易 trade    → 暖橙（强调层 5%）：可支付动作
+ *   · 行程 trip     → 品牌青（品牌层 15%）：可查看行程
+ *   · 系统/互动     → 中性灰：纯通知，不可点动作
+ * 灰色用 --c-muted，因为它是 tokens 里给「系统图标底」定义的弱化色。
+ */
+const AVATAR_BG: Record<string, string> = {
+  trade: 'var(--c-accent)',
+  trip: 'var(--c-brand)',
+  social: 'var(--c-muted)',
+  system: 'var(--c-muted)',
+}
+function avatarBg(type: string): string {
+  return AVATAR_BG[type] ?? 'var(--c-muted)'
+}
+
+/**
  * 全量消息：一次拉回，分类和计数都在本地派生。
  *
  * 改成这样是因为原来「切一次分类拉一次」有两个硬伤：
@@ -103,6 +133,13 @@ async function load() {
   }
 }
 onMounted(load)
+
+/* 下拉刷新：拉最新消息（load 内部已处理失败，刷新态交给 Vant 收回） */
+const refreshing = ref(false)
+async function onRefresh() {
+  await load()
+  refreshing.value = false
+}
 
 /** 当前分类要展示的消息（本地过滤；非行程/系统类一律不展示） */
 const messages = computed<Message[]>(() => {
@@ -123,6 +160,28 @@ const counts = computed<Record<CatKey, number>>(() => {
 
 /* 按真实日期分组 */
 const DAY_MS = 86_400_000
+
+/**
+ * 消息内时间戳：相对格式（今天/昨天/近 7 天带时刻，更早只给日期）。
+ * 分组的「今天/本周/更早」标签已承担日期语义，卡片里再给一次当天时刻就够了。
+ */
+function pad2(n: number) { return String(n).padStart(2, '0') }
+function relTime(iso: string): string {
+  const t = new Date(iso)
+  if (Number.isNaN(t.getTime())) return ''
+  const now = new Date()
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const diff = startOfDay(now) - startOfDay(t)
+  const hm = `${pad2(t.getHours())}:${pad2(t.getMinutes())}`
+  if (diff === 0) return `今天 ${hm}`
+  if (diff === DAY_MS) return `昨天 ${hm}`
+  if (diff < 7 * DAY_MS) return `${t.getMonth() + 1}月${t.getDate()}日 ${hm}`
+  const sameYear = t.getFullYear() === now.getFullYear()
+  return sameYear
+    ? `${t.getMonth() + 1}月${t.getDate()}日`
+    : `${t.getFullYear()}年${t.getMonth() + 1}月${t.getDate()}日`
+}
+
 const groups = computed(() => {
   const now = new Date()
   // 今天 0 点；「本周」按近 7 天（含今天）算，比自然周的边界更符合直觉
@@ -154,8 +213,57 @@ async function readAll() {
   }
 }
 
-function onCta(m: Message) {
+/**
+ * 一键清空：先二次确认（不可恢复），确认后删全部消息、清空本地列表。
+ * 没消息时直接提示，不弹确认框。
+ */
+async function onClearAll() {
+  if (!allMessages.value.length) {
+    showToast({ message: '暂无消息可清空', position: 'top' })
+    return
+  }
+  try {
+    await showConfirmDialog({ title: '清空全部消息', message: '将删除你的全部消息，且不可恢复。' })
+  } catch {
+    return // 用户在确认框点了取消
+  }
+  try {
+    await clearAllMessages()
+    allMessages.value = []
+    showToast({ message: '消息已清空', position: 'top' })
+  } catch {
+    showToast({ message: '操作失败，请重试', position: 'top' })
+  }
+}
+
+/**
+ * 点击消息卡片（含 CTA 按钮）：
+ * ① 未读先标读——乐观更新本地 unread（分类徽标随 counts 联动），失败回滚；
+ * ② 行程类消息跳行程列表；交易/系统/互动暂无落点（交易支付未上线），只标读。
+ */
+async function onItem(m: Message) {
+  if (m.unread) {
+    const prev = m.unread
+    m.unread = false
+    try {
+      await readMessage(m.id)
+    } catch {
+      m.unread = prev
+      showToast({ message: '操作失败，请重试', position: 'top' })
+      return
+    }
+  }
   if (m.cta?.kind === 'view') router.push('/trip')
+}
+
+/** 左滑删除：成功后本地移除（分类徽标计数随 counts 联动），失败 toast */
+async function onDelete(m: Message) {
+  try {
+    await deleteMessage(m.id)
+    allMessages.value = allMessages.value.filter((x) => x.id !== m.id)
+  } catch {
+    showToast({ message: '删除失败，请重试', position: 'top' })
+  }
 }
 </script>
 
@@ -177,7 +285,10 @@ function onCta(m: Message) {
 :deep(.van-nav-bar::after) { border-color: var(--c-divider); }
 :deep(.van-nav-bar__title) { font-weight: 700; color: var(--c-text); }
 :deep(.van-nav-bar .van-icon) { color: var(--c-text); }
-.read-all { font-size: 13px; color: var(--c-brand); font-weight: 600; }
+/* 顶栏右侧操作：全部已读 / 清空（两个轻量文字操作） */
+.nav-act { font-size: 13px; color: var(--c-brand); font-weight: 600; margin-left: 12px; }
+.nav-act:first-child { margin-left: 0; }
+.nav-act--danger { color: var(--c-red); }
 
 /* ---------- 分类筛选 ---------- */
 .cats {
@@ -231,14 +342,31 @@ function onCta(m: Message) {
 }
 
 /* ---------- 消息项 ---------- */
+/* 间距放在 swipe-cell 上：item 本身零 margin，左滑露出的删除按钮才能与卡等高 */
+.msg-cell { margin-bottom: 8px; }
 .item {
   display: flex;
   gap: 12px;
   align-items: flex-start;
   padding: 14px 12px;
-  margin-bottom: 8px;
   background: var(--c-card);
   border-radius: 12px;
+}
+
+/* 左滑删除按钮：全高红块，右滑区语义「删掉这条」。
+   只圆右侧（按钮永远在卡片右边）：圆角与 .item 的 12px 一致，左滑露出的
+   轮廓才是一张完整圆角卡，而不是红块上方卡出个方角。 */
+.item__del {
+  height: 100%;
+  width: 72px;
+  border: none;
+  background: var(--c-red);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  display: grid;
+  place-items: center;
+  border-radius: 0 12px 12px 0;
 }
 .item__avatar {
   position: relative;
@@ -300,6 +428,33 @@ function onCta(m: Message) {
   border: 1px solid var(--c-brand-soft);
 }
 .cta--view:active { background: var(--c-brand-soft); }
+
+/* ---------- 空状态 ---------- */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 72px 0 48px;
+}
+.empty__ic {
+  width: 72px; height: 72px;
+  border-radius: 50%;
+  display: grid; place-items: center;
+  font-size: 34px;
+  color: var(--c-muted);
+  background: var(--c-card);
+  border: 1px solid var(--c-divider);
+}
+.empty__title {
+  margin: 16px 0 0;
+  font-size: 15px; font-weight: 600;
+  color: var(--c-read);
+}
+.empty__desc {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--c-old);
+}
 
 /* ---------- 底部提示 ---------- */
 .end-tip {

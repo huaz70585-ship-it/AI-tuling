@@ -1,5 +1,5 @@
 import { Router } from 'express'
-import { getTripListRows, getTripDetail, run, queryOne, queryAll, parseJSON, transaction } from '../db.js'
+import { getTripListRows, getTripDetail, run, queryOne, queryAll, transaction } from '../db.js'
 import { ok, err } from '../utils/response.js'
 import { authMiddleware } from '../utils/auth.js'
 import { rateLimit } from '../utils/rateLimit.js'
@@ -7,6 +7,15 @@ import { chatOnce, extractJson, aiReady } from '../utils/ai.js'
 import { buildAppendDaysMessages, buildRefillDayMessages, buildOptimizeTripMessages } from '../utils/tripPrompt.js'
 import { removeStaleBoundaryItems, syncTitleDayCount } from '../utils/tripBoundary.js'
 import { resolveCityFromTitle } from '../utils/city.js'
+import { todayIso } from '../utils/date.js'
+// 边界项（抵达/返程）位置约束：移动接口要拦下把它们挤离首/末的交换
+import { boundaryMoveError } from '../utils/boundary.js'
+// 人均价解析 / 一天计划落库 / 预算重算 —— 与 agent 的 optimize_trip 工具共用同一套口径
+import { createDayItems, writeDayPlan, recalcTripBudget, isPlaceholderTitle } from '../utils/tripStore.js'
+// 消息通知（全站唯一写 messages 表的地方）
+import { notifyTrip, notifyWeatherAlert, notifyDisclaimer } from '../utils/notify.js'
+// 行程天气（保存后 fire-and-forget 查预警用）
+import { fetchTripWeather } from '../utils/forecast.js'
 
 const router = Router()
 
@@ -22,127 +31,6 @@ const APPEND_BATCH = 5
 
 const DAY_MS = 86_400_000
 
-/** 儿童按成人价的一半计费 */
-const CHILD_PRICE_RATIO = 0.5
-
-/** 计费人数权重：成人 1，儿童 0.5 */
-function headWeight(t) {
-  const adults = Number(t?.adults) || 0
-  const children = Array.isArray(t?.children) ? t.children.length : 0
-  return adults + children * CHILD_PRICE_RATIO
-}
-
-/**
- * 从「故宫（60）」这类文本里解析【人均价】。
- * 兼容全角/半角括号，只在结尾处取括号；括号里取第一个数字，取不到（如「免费」）按 0 算。
- * 例：「天安门广场（免费）」→ 0；「景山公园(2元看日落)」→ 2；「故宫（60）」→ 60
- */
-function parsePersonPrice(text) {
-  const m = String(text).match(/[（(]([^）)]*)[）)]\s*$/)
-  if (!m) return 0
-  const num = m[1].match(/\d+(?:\.\d+)?/)
-  return num ? Math.round(Number(num[0])) : 0
-}
-
-/**
- * 把一天的摘要文本拆成多个行程项落库，返回这一天的人均价合计。
- *
- * 摘要口径与 tripPrompt.js 的 dayFormatRules() 严格对齐：
- *   「Day1 灵隐寺（45）+飞来峰（含于票价）+永福寺（免费）」
- * 按 + / → 拆项，每项【结尾括号】里的数字即人均价，拆不出按 0。
- *
- * 抽成函数是因为有两个调用方：POST /trips（整条新建）与
- * 日期变长后的补排（PATCH /trip/:id、POST /trip/:id/day/:dayIndex/generate）。
- * 两处各写一遍，解析口径早晚漂移。
- */
-function createDayItems(tripId, dayId, summaryText) {
-  const itemTexts = String(summaryText)
-    .replace(/^Day\s*\d+(-\d+)?\s*[：:，,。]?\s*/i, '') // 去掉 "Day1 " / "Day1-3 " 前缀
-    .split(/[+＋→]/)
-    .map((s) => s.trim())
-    .filter((s) => s)
-  const items = itemTexts.length ? itemTexts : [String(summaryText)]
-
-  let personTotal = 0
-  items.forEach((itemText, j) => {
-    const price = parsePersonPrice(itemText)
-    personTotal += price
-    run(
-      'INSERT INTO trip_items (id, trip_id, trip_day_id, sort_order, type, title, start_time, price_ref, source) VALUES (?,?,?,?,?,?,?,?,?)',
-      [
-        `${dayId}-i${j + 1}`,
-        tripId,
-        dayId,
-        j + 1,
-        'sight',
-        // 标题保留「故宫（60）」原样（卡片上直接显示价格），人均价另存 price_ref
-        itemText,
-        `${String(9 + j * 2).padStart(2, '0')}:00`, // 从 09:00 起，每项间隔 2 小时
-        price,
-        'ai',
-      ],
-    )
-  })
-  return personTotal
-}
-
-/**
- * 清掉某一天的全部行程项，以及指向它们的交通衔接。
- *
- * trip_hops 只对 trips(id) 建了 CASCADE，对 item 没有外键，
- * 所以删项时必须手工清 —— 否则留下指不到任何行程项的孤立行。
- * 子查询要赶在 trip_items 被删之前跑。
- */
-function clearDayItems(dayId) {
-  run('DELETE FROM trip_hops WHERE from_item_id IN (SELECT id FROM trip_items WHERE trip_day_id = ?)', [dayId])
-  run('DELETE FROM trip_hops WHERE to_item_id IN (SELECT id FROM trip_items WHERE trip_day_id = ?)', [dayId])
-  run('DELETE FROM trip_items WHERE trip_day_id = ?', [dayId])
-}
-
-/**
- * 给某一天写入 AI 排好的摘要：改 title → 清旧项 → 建新项（一天一组，原子）。
- * 「改 title + 删 + 建」必须原子，否则中途失败会留下「标题是新的、项还是旧的」。
- */
-function writeDayPlan(tripId, dayIndex, summary) {
-  const day = queryOne('SELECT * FROM trip_days WHERE trip_id = ? AND day_index = ?', [tripId, dayIndex])
-  if (!day) return false
-  transaction(() => {
-    run('UPDATE trip_days SET title = ? WHERE id = ?', [summary, day.id])
-    clearDayItems(day.id)
-    createDayItems(tripId, day.id, summary)
-  })
-  return true
-}
-
-/**
- * 按行程项算总预算（只算不落库）。
- * 口径：Σ(item.price_ref) × 计费人数权重。price_ref 存的是【人均价】。
- */
-function computeBudget(tripId, traveler) {
-  const row = queryOne(
-    'SELECT COALESCE(SUM(price_ref), 0) AS s FROM trip_items WHERE trip_id = ?',
-    [tripId],
-  )
-  return Math.round(Number(row?.s || 0) * headWeight(traveler))
-}
-
-/**
- * 重算总预算并落库，返回新值。
- * trips.budget_total 是冗余列：行程项一增删，它就跟实际对不上了。
- * 前端底部「本次行程总预算」读的正是这一列，所以增删项后必须重算。
- */
-function recalcTripBudget(tripId) {
-  const row = queryOne('SELECT traveler FROM trips WHERE id = ?', [tripId])
-  if (!row) return null
-  const budget = computeBudget(tripId, parseJSON(row.traveler, { adults: 1 }))
-  run('UPDATE trips SET budget_total = ?, updated_at = ? WHERE id = ?', [
-    budget,
-    new Date().toISOString(),
-    tripId,
-  ])
-  return budget
-}
-
 /** 两个 YYYY-MM-DD 相差的整天数（取 UTC 正午做锚点，规避时区/夏令时偏移） */
 function diffDays(a, b) {
   return Math.round((Date.parse(`${b}T12:00:00Z`) - Date.parse(`${a}T12:00:00Z`)) / DAY_MS)
@@ -155,10 +43,36 @@ function addDays(iso, n) {
   return d.toISOString().slice(0, 10)
 }
 
+/** 允许的最远出发日：两年后。再远基本是模型算错了（或用户乱说） */
+const MAX_START_AHEAD_DAYS = 730
+
+/**
+ * 收敛 AI 给的出发日期。
+ *
+ * 模型的日期是「生成的」，不能直接信：可能缺失、格式错、写成过去，
+ * 甚至把「25号」理解成去年的 25 号。这里一律兜到合法值：
+ * - 缺失 / 格式不对 / 不是真日期 → 今天
+ * - 早于今天 → 今天（否则行程一建出来就是「已结束」，行中模式永远不会触发）
+ * - 超过两年 → 今天（异常值，别让日历拉出跨年区间）
+ *
+ * 注意「早于今天一律收到今天」是刻意的：宁可让用户看到从今天开始，
+ * 也不要生成一条过去时间的行程 —— 后者比日期不准更让人困惑。
+ */
+function normalizeStartDate(raw) {
+  const today = todayIso()
+  const s = String(raw ?? '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return today
+  // 正则只保证形状，还要挡掉 2026-02-31 这种不存在的日子
+  if (Number.isNaN(Date.parse(`${s}T12:00:00Z`))) return today
+  if (s < today) return today
+  if (s > addDays(today, MAX_START_AHEAD_DAYS)) return today
+  return s
+}
+
 // 行程相关接口都需要登录
 router.use(authMiddleware)
 
-/** POST /v1/trips  从 AI 生成的行程创建（title + days 摘要数组） */
+/** POST /v1/trips  从 AI 生成的行程创建（title + start_date + days 摘要数组） */
 router.post('/trips', (req, res) => {
   const { title, days } = req.body || {}
   if (!title || !Array.isArray(days) || !days.length) return err(res, '标题与天数必填')
@@ -167,10 +81,10 @@ router.post('/trips', (req, res) => {
 
   const id = 't' + Date.now() + Math.random().toString(36).slice(2, 6)
   const now = new Date().toISOString()
-  const start = new Date()
-  const end = new Date(start)
-  end.setDate(end.getDate() + days.length - 1)
-  const fmt = (d) => d.toISOString().slice(0, 10)
+  // 出发日期由 AI 按用户说的推算（见 chat.js 的 prompt），这里只做兜底校验。
+  // 全部日期运算走 addDays(iso, n)（UTC 正午锚点），不再用 new Date() + toISOString ——
+  // 后者是 UTC，东八区凌晨会整体偏一天。
+  const startIso = normalizeStartDate(req.body?.start_date)
   // 目的地城市：从标题解析出【内置城市】则写入 destination_id，
   // 让天气定位（weather.js）在步骤 1 直接命中，不靠标题匹配 —— 更稳。
   // 标题不在内置 4 城时 destination_id 留空，靠步骤 2/3 的名字匹配兜底。
@@ -184,15 +98,13 @@ router.post('/trips', (req, res) => {
   transaction(() => {
     run(
       'INSERT INTO trips (id, user_id, title, destination_id, start_date, end_date, day_count, status, source, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)',
-      [id, req.user.id, title, destinationId, fmt(start), fmt(end), days.length, 'ready', 'ai', now],
+      [id, req.user.id, title, destinationId, startIso, addDays(startIso, days.length - 1), days.length, 'ready', 'ai', now],
     )
 
     days.forEach((d, i) => {
       const dId = id + '-d' + (i + 1)
-      const dDate = new Date(start)
-      dDate.setDate(dDate.getDate() + i)
       // trip_days.title 存当天概览，trip_items 存拆分后的各景点/活动
-      run('INSERT INTO trip_days (id, trip_id, day_index, date, title) VALUES (?,?,?,?,?)', [dId, id, i + 1, fmt(dDate), String(d)])
+      run('INSERT INTO trip_days (id, trip_id, day_index, date, title) VALUES (?,?,?,?,?)', [dId, id, i + 1, addDays(startIso, i), String(d)])
       // 拆分与人均价解析统一走 createDayItems（与「日期变长后补排」同一套口径）
       personTotal += createDayItems(id, dId, String(d))
     })
@@ -201,6 +113,24 @@ router.post('/trips', (req, res) => {
     // 之后在详情页改人数时，PATCH /trip/:id 会按新权重等比重算。
     run('UPDATE trips SET budget_total = ? WHERE id = ?', [Math.round(personTotal * 1), id])
   })
+
+  // 通知：保存成功 → 行程消息；该用户第一条行程再补一条 AI 免责声明。
+  notifyTrip(req.user.id, { title, preview: `共 ${days.length} 天行程，可随时查看或继续调整` })
+  if (!queryAll('SELECT id FROM trips WHERE user_id = ?', [req.user.id]).length) {
+    notifyDisclaimer(req.user.id)
+  }
+
+  // 天气预警：查 Open-Meteo 要走网络（最长 8s），fire-and-forget —— 保存响应不等它。
+  // 行程期间有雨/雪/雷/雾就弹一条系统消息；查不到或没异常天气就静默。
+  fetchTripWeather({ title, destination_id: destinationId, start_date: startIso, end_date: addDays(startIso, days.length - 1) })
+    .then((w) => {
+      if (!w.days.length) return
+      const hit = w.days.find((d) => ['rain', 'snow', 'thunder', 'fog'].includes(d.icon))
+      if (!hit) return
+      const dayNum = diffDays(startIso, hit.date) + 1
+      notifyWeatherAlert(req.user.id, title, `D${dayNum}`, hit.text)
+    })
+    .catch(() => { /* 天气拿不到就不提醒 */ })
 
   ok(res, { id, title, day_count: days.length })
 })
@@ -248,9 +178,6 @@ router.delete('/trip/:id/item/:itemId', (req, res) => {
   })
   ok(res, { id: req.params.itemId, budget_total })
 })
-
-/** 占位标题：日期变长时补建的空天，title 只有 "D3"。喂给 AI 时应当忽略，免得它以为已有安排 */
-const isPlaceholderTitle = (t) => /^D\d+$/.test(String(t || '').trim())
 
 /** 剥掉结尾的价格括号：「万象城闲逛（免费）」→「万象城闲逛」 */
 const bareTitle = (t) => String(t || '').replace(/[（(][^）)]*[）)]\s*$/, '').trim()
@@ -539,6 +466,22 @@ router.patch('/trip/:id', async (req, res) => {
   //   refilled_days  — 被摘短之后又补齐了哪些
   //   stale_closings — 摘掉了哪些失效的边界项（前端据此说明「为什么 D3 的返程没了」）
   // 失败时前端会在空天上给「让 AI 补排」的重试入口。
+  // 行程信息变化通知：改完就走的人，回来也有一条「已更新」入口（事务已提交，必弹）
+  const mmdd = (iso) => iso.slice(5).replace('-', '.') // YYYY-MM-DD → MM.DD
+  if (dayCount !== trip.day_count) {
+    notifyTrip(req.user.id, {
+      title: nextTitle,
+      preview: `已更新为 ${mmdd(nextStart)} - ${mmdd(nextEnd)} · ${dayCount} 天`,
+    })
+  } else if (nextStart !== trip.start_date || nextEnd !== trip.end_date) {
+    notifyTrip(req.user.id, {
+      title: nextTitle,
+      preview: `行程日期已更新为 ${mmdd(nextStart)} - ${mmdd(nextEnd)}`,
+    })
+  } else if (nextTraveler !== trip.traveler) {
+    notifyTrip(req.user.id, { title: nextTitle, preview: '出行人数已更新' })
+  }
+
   ok(res, {
     ...getTripDetail(trip.id),
     appended_days: appended,
@@ -590,7 +533,10 @@ router.post('/trip/:id/day/:dayIndex/generate', genDayLimiter, async (req, res) 
       targets: [{ day_index: dayIndex, date: day.date }],
       knownDays,
     })
-    if (r.filled.length) recalcTripBudget(trip.id)
+    if (r.filled.length) {
+      recalcTripBudget(trip.id)
+      notifyTrip(req.user.id, { title: trip.title, preview: `D${dayIndex} 已排好，去看看今天的安排吧` })
+    }
     ok(res, { ...getTripDetail(trip.id), appended_days: r.filled, ai_error: r.error })
   } catch (e) {
     console.error('[trip] 单天补排异常:', e)
@@ -666,6 +612,9 @@ router.post('/trip/:id/optimize', optimizeLimiter, async (req, res) => {
   } else {
     recalcTripBudget(trip.id)
   }
+  if (changed.length) {
+    notifyTrip(req.user.id, { title: trip.title, preview: '行程已按你的要求重排，看看新安排吧' })
+  }
   ok(res, { ...getTripDetail(trip.id), optimized_days: changed, ai_error: aiError })
 })
 
@@ -680,9 +629,9 @@ router.patch('/trip/:id/item/:itemId', (req, res) => {
   const item = queryOne('SELECT * FROM trip_items WHERE id = ? AND trip_id = ?', [req.params.itemId, req.params.id])
   if (!item) return err(res, '行程项不存在', 404)
 
-  // 找同一天的相邻项（按 sort_order 排序）
+  // 找同一天的相邻项（按 sort_order 排序）。要 title：边界判定靠标题语义
   const siblings = queryAll(
-    'SELECT id, sort_order, start_time FROM trip_items WHERE trip_day_id = ? ORDER BY sort_order',
+    'SELECT id, title, sort_order, start_time FROM trip_items WHERE trip_day_id = ? ORDER BY sort_order',
     [item.trip_day_id],
   )
   const idx = siblings.findIndex((s) => s.id === item.id)
@@ -692,6 +641,13 @@ router.patch('/trip/:id/item/:itemId', (req, res) => {
   if (swapIdx < 0 || swapIdx >= siblings.length) {
     return ok(res, { id: item.id, swapped: false }) // 已到顶/底，无需交换
   }
+
+  // 边界项（抵达/返程）固定在当天首/末。这里判的是【交换之后的整个顺序】，
+  // 而不是「拖的是不是边界项」—— 把第二项往上拖同样会把「抵达」顶到中间，
+  // 只判被拖项会漏掉这种情况。前端也会禁用入口，这里是兜底（防旧客户端/直连请求）。
+  const blockReason = boundaryMoveError(siblings, idx, swapIdx)
+  if (blockReason) return err(res, blockReason)
+
   const swap = siblings[swapIdx]
 
   // 两次 sort_order 交换 + 整组时间槽重排必须原子。
@@ -717,6 +673,36 @@ router.patch('/trip/:id/item/:itemId', (req, res) => {
   })
 
   ok(res, { id: item.id, swapped: true })
+})
+
+/**
+ * POST /v1/trip/:id/item/:itemId/check  行中打卡 { done: true | false }
+ *
+ * 三个刻意的取舍：
+ * 1. 【不带乐观锁】。打卡是自己点自己的，冲突概率≈0；带 If-Match 就得多一次
+ *    往返、还可能 409 打断正在路上走的人，代价大于收益。
+ * 2. 【支持 done:false 撤销】。只给单向打卡的话，点错一个就永久错了。
+ * 3. 【幂等】。重复打卡只刷新 done_at，不报错 —— 移动端重发是常态。
+ *
+ * 打卡【不重算预算】：它只标状态、不改价格，budget_total 不该动。
+ * 前端「今天还要花多少」是自己按未打卡项算的，属于展示层。
+ */
+router.post('/trip/:id/item/:itemId/check', (req, res) => {
+  const trip = queryOne('SELECT id, user_id FROM trips WHERE id = ?', [req.params.id])
+  if (!trip) return err(res, '行程不存在', 404)
+  if (trip.user_id !== req.user.id) return err(res, '无权访问', 403)
+
+  const done = req.body?.done !== false // 不传按打卡处理，显式 false 才是撤销
+  const item = queryOne('SELECT id FROM trip_items WHERE id = ? AND trip_id = ?', [
+    req.params.itemId,
+    req.params.id,
+  ])
+  if (!item) return err(res, '行程项不存在', 404)
+
+  const doneAt = done ? new Date().toISOString() : null
+  run('UPDATE trip_items SET done_at = ? WHERE id = ?', [doneAt, item.id])
+
+  ok(res, { id: item.id, done_at: doneAt })
 })
 
 export default router
