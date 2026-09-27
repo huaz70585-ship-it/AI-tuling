@@ -4,6 +4,7 @@ import { queryAll, queryOne, run } from '../db.js'
 import { ok, err } from '../utils/response.js'
 import { authMiddleware } from '../utils/auth.js'
 import { chatOnce, extractJson, aiReady } from '../utils/ai.js'
+import { recalcTripBudget } from '../utils/tripStore.js'
 
 const router = Router()
 
@@ -103,30 +104,140 @@ const HOP_SYSTEM = `你是旅行行程的「交通衔接」助手。用户会给
 
 严格要求：
 1. 只输出 JSON，不要任何解释、不要 markdown 代码块以外的文字。
-2. 输出格式：{"hops":[{"from":"起点名","to":"终点名","mode":"walk|bus|metro|taxi|bike|coach","duration_min":数字,"cost":数字,"tip":"不超过15字的一句提醒"}]}
+2. 输出格式：{"hops":[{"from":"起点名","to":"终点名","mode":"walk|bus|metro|taxi|bike|coach","duration_min":数字,"cost":数字,"tip":"不超过15字的一句提醒","steps":[{"icon":"walk|metro|bus|taxi|bike|coach|exit|transfer","text":"..."}],"alts":[{"mode":"...","duration_min":数字,"cost":数字,"steps":[{"icon":"...","text":"..."}]}]}]}
 3. hops 数量必须等于「地点数 - 1」，顺序与输入顺序严格一致。
 4. duration_min 是不含等待的纯在途时间，填整数分钟；cost 是【每人】预估花费（元，整数，免费填 0）。
-5. 【铁律 · 违反即失败】你没有实时地图数据，绝对禁止输出具体线路编号：
-   - 任何字段里都不允许出现「2号线」「10号线」「7路」「游2」这类具体线路编号。
-   - 只写交通方式本身：地铁 / 公交 / 景区接驳车 / 打车 / 步行 / 骑行。
-   - 例：写「乘地铁到南京东路一带」而不是「乘2号线转10号线到南京东路站」。
+5. 【铁律 · 违反即失败】你没有实时地图数据，具体线路可能不准，但**用户明确要看「几号线到几号、哪站下、哪个口出」**：
+   - steps 里可以写具体线路/站点/出口（如「乘地铁2号线坐5站」「人民广场换乘10号线」「南京东路站3号口出步行3分钟」），但拿不准的用「地铁」「公交」泛称，不要编造离谱站名。
+   - tip 里不要写线路编号，也【不要写具体金额】（如"打车约35元"）——费用模型估不准，写死会让用户现场对不上账；tip 只写时长或一句注意事项（如"打车约15分钟"）。
    - 距离近、在同一景区内的景点（寺庙群、园林群），正确答案通常是 walk，不要强行推荐地铁或公交。
+   - 【文案粒度--不许偷懒只写""乘公交前往XX""】：
+     · 公交/地铁：写清「乘X路公交 / 地铁X号线，XX站上车→XX站下车，哪个口出」；站名拿不准可用泛称，但线路号必须给；
+     · 步行：写清朝向和大致时长（如「沿民族大道向东步行约10分钟」）；
+     · 打车：tip 只保留「约X分钟」，不写金额。
    - 拿不准时长就按常识给合理区间中值，不要给 0。
 6. 若某个地点写成「返程：前往当地的火车站或机场」，说明这一段是行程末尾前往车站/机场
    （用户可能坐高铁也可能坐飞机）：按市内交通给合理时长，不确定就按打车估；
-   tip 里提一句预留取票安检时间。不要反问，也不要输出具体车次/航班号。`
+   tip 里提一句预留取票安检时间。不要反问，也不要输出具体车次/航班号。
+7. alts 是这段路除主选 mode 外用户也可以选的 2~3 个备选交通方式：同样填 mode/duration_min/cost
+   和 steps（与主选同规则）。按「对普通人而言的性价比/体验」排序；不要包含与主选相同的方式，
+   拿不准备选的时长/费用就按常识给合理值，不要给 0。
+8. steps 是这条路的**详细分步走法**，3~6 步，每步是一个对象 {"icon":"动作","text":"一句话"}，按先后顺序：
+   - icon 只允许这 8 个值：walk(步行) / metro(乘地铁) / bus(乘公交) / taxi(打车) / bike(骑行) / coach(城际巴士) / exit(出站口) / transfer(换乘)。
+   - text 不超过 20 字，写清这一段的线路/站点/出口，例如：
+     {"icon":"walk","text":"步行500米到朝阳广场站"}、{"icon":"metro","text":"乘1号线坐5站"}、
+     {"icon":"transfer","text":"金湖广场站换乘3号线"}、{"icon":"exit","text":"青秀站D口出站"}。
+   - 乘车段用对应交通 icon，换乘单独用 transfer，出站单独用 exit，进站前的步行用 walk。
+   - 纯步行/骑行可简化成 1~2 步（icon 用 walk / bike）。拿不准站名用「地铁某站」泛称，别编造离谱站名。`
 
 /** 同一对项并发只算一次（多人同时打开同一行程时，避免重复烧 token） */
 const inflight = new Map()
 
-/** 把模型返回的一段结果落库；已存在则不动（谁先写谁赢） */
+/** 步骤动作图标的合法值（前端据此匹配 SVG 图标） */
+const STEP_ICONS = new Set(['walk', 'metro', 'bus', 'taxi', 'bike', 'coach', 'exit', 'transfer'])
+
+/**
+ * 分步走法归一化：统一成 [{"icon":"动作","text":"一句话"}]。
+ * - icon 只留 STEP_ICONS 里的值，其余归 walk；
+ * - text 压缩空白、限长 20 字、去空；
+ * - 最多 6 步。
+ * 兼容纯字符串数组（本功能早期版本的结构：`["乘地铁2号线坐5站", ...]`）：
+ * 字符串当作 text、icon 归 walk。读侧也要过这一层 —— 老缓存就是字符串数组。
+ * 注意：与 tip 不同，text 允许出现线路/站点/出口（用户明确要看「几号线/哪站下/哪个口」），
+ * 所以这里不做 scrubRouteNo 的线路号清除。
+ */
+function normalizeSteps(steps) {
+  if (!Array.isArray(steps)) return []
+  const out = []
+  for (const s of steps) {
+    // 老数据是纯字符串：转换成 { icon: 'walk', text } 兼容
+    if (typeof s === 'string') {
+      const t = String(s).replace(/\s+/g, ' ').trim().slice(0, 20)
+      if (t) out.push({ icon: 'walk', text: t })
+      continue
+    }
+    const text = String(s?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 20)
+    if (!text) continue
+    const icon = STEP_ICONS.has(String(s?.icon)) ? String(s.icon) : 'walk'
+    out.push({ icon, text })
+  }
+  return out.slice(0, 6)
+}
+
+/** 落库用：归一化后序列化成 JSON 字符串 */
+function sanitizeSteps(steps) {
+  return JSON.stringify(normalizeSteps(steps))
+}
+
+/**
+ * 这段缓存的分步走法是否「过期」—— 需要删掉重算。
+ * 过期 = 空数组 / 坏 JSON / 还是旧的纯字符串结构（没有 icon，前端渲染不出图标动线）。
+ * 之所以不能放着不管：saveHop 是 ON CONFLICT DO NOTHING，
+ * 老行不删就永远不会被新结果覆盖，用户会一直看到没有图标的分步或干脆没有分步。
+ */
+function stepsStale(raw) {
+  if (!raw) return true
+  let arr
+  try {
+    arr = JSON.parse(raw)
+  } catch {
+    return true
+  }
+  if (!Array.isArray(arr) || !arr.length) return true
+  // 任何一项不是 { icon, text } 结构（比如旧字符串数组）都算过期
+  return arr.some((s) => typeof s !== 'object' || s === null || !s.text)
+}
+
+/**
+ * 备选交通清洗：只留合法 mode、数值取整容错、剔除与主选重复的方式、去重、最多 3 项。
+ * 每个备选带「怎么走」的 steps（同主推规则清洗）。
+ * 返回 JSON 字符串落库；输入不合法时回退空数组。
+ */
+function sanitizeAlts(alts, mainMode) {
+  if (!Array.isArray(alts)) return '[]'
+  const seen = new Set()
+  const out = []
+  for (const a of alts) {
+    const mode = MODES.has(String(a?.mode)) ? String(a.mode) : null
+    if (!mode || mode === mainMode || seen.has(mode)) continue
+    seen.add(mode)
+    out.push({
+      mode,
+      duration_min: clampInt(a?.duration_min, 0, 1440),
+      cost_ref: clampInt(a?.cost, 0, 9999),
+      steps: normalizeSteps(a?.steps),
+    })
+  }
+  return JSON.stringify(out.slice(0, 3))
+}
+
+/** alts 列 → 数组；空 / 坏 JSON 一律回退空数组 */
+function parseAlts(raw) {
+  if (!raw) return []
+  try {
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+/** 把模型返回的一段结果落库。UPSERT：老缓存结构过期时原地升级，不留残行 */
 function saveHop(tripId, fromId, toId, h) {
   const mode = MODES.has(String(h?.mode)) ? String(h.mode) : 'unknown'
   run(
     `INSERT INTO trip_hops
-       (id, trip_id, from_item_id, to_item_id, mode, duration_min, cost_ref, tip, source, created_at)
-     VALUES (?,?,?,?,?,?,?,?, 'ai', ?)
-     ON CONFLICT(from_item_id, to_item_id) DO NOTHING`,
+       (id, trip_id, from_item_id, to_item_id, mode, duration_min, cost_ref, tip, alts, steps, source, created_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?, 'ai', ?)
+     ON CONFLICT(from_item_id, to_item_id) DO UPDATE SET
+       mode = excluded.mode,
+       duration_min = excluded.duration_min,
+       cost_ref = excluded.cost_ref,
+       tip = excluded.tip,
+       alts = excluded.alts,
+       steps = excluded.steps,
+       source = 'ai',
+       created_at = excluded.created_at`,
     [
       randomUUID(),
       tripId,
@@ -136,6 +247,8 @@ function saveHop(tripId, fromId, toId, h) {
       clampInt(h?.duration_min, 0, 1440),
       clampInt(h?.cost, 0, 9999),
       scrubRouteNo(h?.tip || '').slice(0, 40),
+      sanitizeAlts(h?.alts, mode),
+      sanitizeSteps(h?.steps),
       new Date().toISOString(),
     ],
   )
@@ -202,8 +315,12 @@ router.get('/trip/:id/hops', async (req, res) => {
 
   let aiError = null
   if (pairs.length) {
+    // 结构过期的老缓存（早期版本没这列，或只存了纯文本步骤）当作「未缓存」重算，
+    // 由 saveHop 的 UPSERT 原地升级。不删行是刻意的：AI 失败时旧数据还留着，
+    // 用户至少还能看到原本的 tip，而不是交通条整片消失。
     const existing = new Set(
-      queryAll('SELECT from_item_id, to_item_id FROM trip_hops WHERE trip_id = ?', [tripId])
+      queryAll('SELECT from_item_id, to_item_id, steps FROM trip_hops WHERE trip_id = ?', [tripId])
+        .filter((r) => !stepsStale(r.steps))
         .map((r) => `${r.from_item_id}|${r.to_item_id}`),
     )
     const missing = pairs.filter((p) => !existing.has(`${p.from.id}|${p.to.id}`))
@@ -225,6 +342,8 @@ router.get('/trip/:id/hops', async (req, res) => {
         }
         try {
           await task
+          // 新落库的交通段带 cost_ref，写进后顺手重算一次总预算（原来只算门票）
+          recalcTripBudget(tripId)
         } catch (e) {
           aiError = 'AI 暂时不可用'
           console.error('[hop] AI 生成失败:', e.message)
@@ -250,6 +369,9 @@ router.get('/trip/:id/hops', async (req, res) => {
       duration_min: r?.duration_min ?? null,
       cost_ref: r?.cost_ref ?? null,
       tip: r?.tip || '',
+      alts: parseAlts(r?.alts).map((a) => ({ ...a, steps: normalizeSteps(a?.steps) })),
+      /** 详细分步走法（坐几号线/换乘/哪站下/哪个口），空数组前端退回单句 tip */
+      steps: normalizeSteps(parseAlts(r?.steps)),
       source: r?.source || null,
       /**
        * 'return' = 这一段是「最后一站 → 返程」，终点没有真实地名（用占位符估的），

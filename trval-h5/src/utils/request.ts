@@ -27,6 +27,14 @@ service.interceptors.request.use(
   (error) => Promise.reject(error),
 )
 
+// 请求可选 silent 标记：后台增强类请求（如交通衔接）失败时不该弹全局 toast
+declare module 'axios' {
+  export interface AxiosRequestConfig {
+    /** true = 失败不弹全局 toast，由调用方自己兜底（静默降级） */
+    silent?: boolean
+  }
+}
+
 // 响应拦截：解包 data、处理业务码与 401
 service.interceptors.response.use(
   (response: AxiosResponse) => {
@@ -34,7 +42,7 @@ service.interceptors.response.use(
     // 约定后端结构 { code, data, message }
     if (res && typeof res === 'object' && 'code' in res) {
       if (res.code === 0 || res.code === 200) return res.data
-      showToast(res.message ?? '请求失败')
+      if (!response.config.silent) showToast(res.message ?? '请求失败')
       return Promise.reject(new Error(res.message ?? 'Error'))
     }
     return res
@@ -46,7 +54,7 @@ service.interceptors.response.use(
       userStore.logout()
       showToast('登录已过期，请重新登录')
       router.push({ path: '/login', query: { redirect: router.currentRoute.value.fullPath } })
-    } else {
+    } else if (!error.config?.silent) {
       // 优先展示后端信封里的中文 message（如 409「行程已被修改，请刷新后重试」）
       const serverMsg = (error.response?.data as { message?: string } | undefined)?.message
       showToast(serverMsg ?? error.message ?? '网络异常')

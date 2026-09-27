@@ -21,28 +21,92 @@ export function aiConfig() {
 export const aiReady = () => Boolean(aiConfig().apiKey)
 
 /**
- * 调一次大模型，返回纯文本内容。
- * temperature 默认 0：交通方案要的是稳定结论，不是创意。
+ * 值得重试的上游状态码：限流与网关抖动。
+ * 实测 DeepSeek 网关会偶发 502，一次抖动就让整批交通衔接失败，代价太大。
  */
-export async function chatOnce(messages, { temperature = 0, timeoutMs = 15_000 } = {}) {
+const TRANSIENT_STATUS = new Set([429, 500, 502, 503, 504])
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * 调一次大模型，返回原始 message（含 tool_calls）与 usage。
+ *
+ * 传 tools 时开启 function calling：模型可能不返回文本，而是返回
+ * message.tool_calls（要调哪个工具、参数是什么）—— agent 循环靠它驱动。
+ * 不传 tools 时行为与原来完全一致，老的 chatOnce 调用方不受影响。
+ *
+ * 失败会重试（默认 2 次，退避 400ms / 1.6s）：
+ * - 429 / 5xx（限流、网关抖动）—— 这是线上最常见的偶发失败；
+ * - 网络层异常（连接被重置等）。
+ * 自身超时（AbortError）不重试：那是「上游太慢」，再等一遍只会更慢。
+ */
+export async function chatCompletion(
+  messages,
+  { tools, temperature = 0, timeoutMs = 15_000, retries = 2, jsonMode = false } = {},
+) {
   const { baseUrl, apiKey, model } = aiConfig()
   if (!apiKey) throw new Error('AI_API_KEY 未配置')
 
-  const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), timeoutMs)
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages, stream: false, temperature }),
-      signal: ac.signal,
-    })
-    if (!res.ok) throw new Error(`上游 HTTP ${res.status}`)
-    const json = await res.json()
-    return json.choices?.[0]?.message?.content ?? ''
-  } finally {
-    clearTimeout(timer)
+  let lastErr
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), timeoutMs)
+    try {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages,
+          stream: false,
+          temperature,
+          ...(tools?.length ? { tools, tool_choice: 'auto' } : {}),
+          // jsonMode：开启 OpenAI 兼容的 JSON 模式，强制模型只吐合法 JSON
+          // （不包 ```json 围栏、不写前后废话）。DeepSeek 兼容该参数。
+          // 与 extractJson() 配合：prompt 里仍要写清字段格式，双保险。
+          ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+        }),
+        signal: ac.signal,
+      })
+      if (!res.ok) {
+        const e = new Error(`上游 HTTP ${res.status}`)
+        e.status = res.status
+        if (TRANSIENT_STATUS.has(res.status) && attempt < retries) {
+          lastErr = e
+          await sleep(400 * (attempt + 1) ** 2)
+          continue
+        }
+        throw e
+      }
+      const json = await res.json()
+      return {
+        message: json.choices?.[0]?.message ?? { role: 'assistant', content: '' },
+        usage: json.usage ?? null,
+      }
+    } catch (e) {
+      // e.status 有值说明是上面明确抛出的上游状态错误（非瞬时的那类），原样向上抛。
+      // 没 status 且不是主动超时 = 网络层失败，重试。
+      const transient = !e.status && e.name !== 'AbortError'
+      if (transient && attempt < retries) {
+        lastErr = e
+        await sleep(400 * (attempt + 1) ** 2)
+        continue
+      }
+      throw e
+    } finally {
+      clearTimeout(timer)
+    }
   }
+  throw lastErr ?? new Error('AI 请求失败')
+}
+
+/**
+ * 调一次大模型，返回纯文本内容。
+ * temperature 默认 0：交通方案要的是稳定结论，不是创意。
+ */
+export async function chatOnce(messages, opts) {
+  const { message } = await chatCompletion(messages, opts)
+  return message.content ?? ''
 }
 
 /** 从模型输出里抠出第一个 JSON 对象（容忍 ```json 包裹与前后废话） */
